@@ -170,7 +170,7 @@ show_banner() {
     echo "║     ╚═╝     ╚═╝  ╚═╝ ╚══▀▀═╝ ╚══════╝   ╚═╝                  ║"
     echo "║                                                              ║"
     echo "║          Raw Packet Tunnel - Firewall Bypass                 ║"
-    echo "║                              Manager v${SCRIPT_VERSION}      ║"
+    echo "║                                 Manager v${SCRIPT_VERSION}                 ║"
     echo "║                                                              ║"
     echo "║          https://t.me/0fariid0                               ║"
     echo "║          https://github.com/0fariid0                         ║"    
