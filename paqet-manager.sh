@@ -5265,7 +5265,7 @@ cron_current() {
     local unit="$1"
     unit="$(normalize_unit "$unit")"
     unit="$(normalize_unit "$unit")"
-    local cmd="systemctl restart ${unit}"
+    local cmd="systemctl restart ${unit%.service}"
     crontab -l 2>/dev/null | grep -F "$cmd" | head -1 || true
 }
 
@@ -5278,7 +5278,7 @@ cron_set() {
 
     unit="$(normalize_unit "$unit")"
     unit="$(normalize_unit "$unit")"
-    local cmd="systemctl restart ${unit}"
+    local cmd="systemctl restart ${unit%.service}"
     local line="${expr} ${cmd}"
 
     if crontab -l 2>/dev/null | grep -Fq "$cmd"; then
@@ -5291,7 +5291,7 @@ cron_remove() {
     local unit="$1"
     unit="$(normalize_unit "$unit")"
     unit="$(normalize_unit "$unit")"
-    local cmd="systemctl restart ${unit}"
+    local cmd="systemctl restart ${unit%.service}"
     if crontab -l 2>/dev/null | grep -Fq "$cmd"; then
         crontab -l 2>/dev/null | grep -Fv "$cmd" | crontab - 2>/dev/null || true
         return 0
