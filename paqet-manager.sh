@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # Paqet Tunnel Manager
-# Version: 7.0.1 (fixed telegram bot keyboard + proxy logic)
+# Version: 7.0
 # Raw packet-level tunneling for bypassing network restrictions
 # GitHub: https://github.com/hanselime/paqet
 # Manager GitHub: https://github.com/0fariid0/Paqet-Tunnel-Manager
@@ -170,7 +170,7 @@ show_banner() {
     echo "║     ██║     ██║  ██║╚██████╔╝███████╗   ██║                  ║"
     echo "║     ╚═╝     ╚═╝  ╚═╝ ╚══▀▀═╝ ╚══════╝   ╚═╝                  ║"
     echo "║                                                              ║"
-    echo "║          Raw Packet Tunnel -- Firewall Bypass                ║"
+    echo "║          Raw Packet Tunnel - Firewall Bypass                 ║"
     echo "║                                 Manager v${SCRIPT_VERSION}                 ║"
     echo "║                                                              ║"
     echo "║          https://github.com/0fariid0                       ║"    
@@ -4817,7 +4817,6 @@ EOF
 load_bot_config() {
     if [ -f "$BOT_CONFIG_FILE" ]; then
         source "$BOT_CONFIG_FILE"
-        : "${USE_WORKER_PROXY:=false}"
     else
         BOT_TOKEN=""
         CHAT_ID=""
@@ -4827,7 +4826,6 @@ load_bot_config() {
         WATCH_INTERVAL="60"
         SOCKS5_PROXY=""
         USE_SOCKS5="false"
-        USE_WORKER_PROXY="false"
     fi
 }
 
@@ -4844,7 +4842,6 @@ ENABLE_SERVICE_WATCH="$ENABLE_SERVICE_WATCH"
 WATCH_INTERVAL="$WATCH_INTERVAL"
 SOCKS5_PROXY="$SOCKS5_PROXY"
 USE_SOCKS5="$USE_SOCKS5"
-USE_WORKER_PROXY="$USE_WORKER_PROXY"
 EOF
     chmod 600 "$BOT_CONFIG_FILE"
     print_success "Bot configuration saved"
@@ -4936,77 +4933,83 @@ socks5:\
 send_telegram_message() {
     local message="$1"
     local parse_mode="${2:-HTML}"
-
+    
     if [ "$ENABLE_BOT" != "true" ] || [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ]; then
         return 1
     fi
 
-    local url_direct="https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
-    local url_worker="https://telegram.behzad.workers.dev/bot${BOT_TOKEN}/sendMessage"
-
-    local payload=""
-    if command -v jq >/dev/null 2>&1; then
-        payload=$(jq -nc --arg chat_id "$CHAT_ID" --arg text "$message" --arg pm "$parse_mode" \
-            '{chat_id:$chat_id,text:$text,parse_mode:$pm,disable_web_page_preview:true}')
-    else
-        # Basic fallback (best-effort)
-        local escaped
-        escaped=$(printf '%s' "$message" | sed 's/"/\"/g')
-        payload=$(printf '{"chat_id":"%s","text":"%s","parse_mode":"%s"}' "$CHAT_ID" "$escaped" "$parse_mode")
-    fi
-
+    message=$(echo -e "$message" | sed 's/"/\\"/g')
+    
     local success=1
-    local response=""
-
-    # 1) SOCKS5 (only if enabled)
-    if [ "${USE_SOCKS5}" = "true" ] && [ -n "${SOCKS5_PROXY}" ]; then
-        response=$(curl -4 -s --max-time 12 --socks5-hostname "$SOCKS5_PROXY" \
-            -X POST "$url_direct" -H "Content-Type: application/json" -d "$payload" 2>&1) || true
+    local response
+    
+    # ============================================
+    # METHOD 1: Through detected SOCKS5 proxy
+    # ============================================
+    if [ "$USE_SOCKS5" = "true" ] && [ -n "$SOCKS5_PROXY" ]; then
+        response=$(curl -s --max-time 8 --socks5-hostname "$SOCKS5_PROXY" \
+            -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "$(printf '{"chat_id":"%s","text":"%s","parse_mode":"%s"}' "$CHAT_ID" "$message" "$parse_mode")" 2>&1)
+        
         if echo "$response" | grep -q '"ok":true'; then
             success=0
             echo "[$(date)] Message sent via SOCKS5 proxy" >> "$BOT_LOG_FILE"
         fi
     fi
-
-    # 2) Direct (default)
+    
+    # ============================================
+    # METHOD 2: Through behzad.workers.dev (Proxy)
+    # ============================================
     if [ $success -ne 0 ]; then
-        response=$(curl -4 -s --max-time 12 \
-            -X POST "$url_direct" -H "Content-Type: application/json" -d "$payload" 2>&1) || true
+        response=$(curl -s --max-time 8 \
+            -X POST "https://telegram.behzad.workers.dev/bot$BOT_TOKEN/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "$(printf '{"chat_id":"%s","text":"%s","parse_mode":"%s"}' "$CHAT_ID" "$message" "$parse_mode")" 2>&1)
+        
+        if echo "$response" | grep -q '"ok":true'; then
+            success=0
+            echo "[$(date)] Message sent via behzad.workers.dev" >> "$BOT_LOG_FILE"
+        fi
+    fi
+    
+    # ============================================
+    # METHOD 3: Direct connection (No proxy)
+    # ============================================
+    if [ $success -ne 0 ]; then
+        response=$(curl -s --max-time 5 \
+            -X POST "https://api.telegram.org/bot$BOT_TOKEN/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "$(printf '{"chat_id":"%s","text":"%s","parse_mode":"%s"}' "$CHAT_ID" "$message" "$parse_mode")" 2>&1)
+        
         if echo "$response" | grep -q '"ok":true'; then
             success=0
             echo "[$(date)] Message sent directly" >> "$BOT_LOG_FILE"
         fi
     fi
-
-    # 3) Optional Workers proxy fallback (only if enabled)
-    if [ $success -ne 0 ] && [ "${USE_WORKER_PROXY}" = "true" ]; then
-        response=$(curl -4 -s --max-time 12 \
-            -X POST "$url_worker" -H "Content-Type: application/json" -d "$payload" 2>&1) || true
-        if echo "$response" | grep -q '"ok":true'; then
-            success=0
-            echo "[$(date)] Message sent via workers proxy" >> "$BOT_LOG_FILE"
-        fi
-    fi
-
-    # 4) Optional Workers proxy URL-encoded (last resort)
-    if [ $success -ne 0 ] && [ "${USE_WORKER_PROXY}" = "true" ]; then
-        response=$(curl -4 -s --max-time 12 \
-            -X POST "$url_worker" \
+    
+    # ============================================
+    # METHOD 4: Through workers.dev with URL-encoded (Last resort)
+    # ============================================
+    if [ $success -ne 0 ]; then
+        response=$(curl -s --max-time 8 \
+            -X POST "https://telegram.behzad.workers.dev/bot$BOT_TOKEN/sendMessage" \
             --data-urlencode "chat_id=$CHAT_ID" \
             --data-urlencode "text=$message" \
-            --data-urlencode "parse_mode=$parse_mode" 2>&1) || true
+            --data-urlencode "parse_mode=$parse_mode" 2>&1)
+        
         if echo "$response" | grep -q '"ok":true'; then
             success=0
-            echo "[$(date)] Message sent via workers proxy (URL-encoded)" >> "$BOT_LOG_FILE"
+            echo "[$(date)] Message sent via workers.dev (URL-encoded)" >> "$BOT_LOG_FILE"
         fi
     fi
-
+    
     if [ $success -eq 0 ]; then
         return 0
+    else
+        echo "[$(date)] Failed to send message. Last response: $response" >> "$BOT_LOG_FILE"
+        return 1
     fi
-
-    echo "[$(date)] Failed to send message. Last response: $response" >> "$BOT_LOG_FILE"
-    return 1
 }
 
 # Debug function
@@ -5054,15 +5057,12 @@ load_config() {
     : "${WATCH_INTERVAL:=60}"
     : "${SOCKS5_PROXY:=}"
     : "${USE_SOCKS5:=false}"
-    : "${USE_WORKER_PROXY:=false}"
 }
 
 tg_base_urls() {
     # Order matters
     echo "https://api.telegram.org/bot${BOT_TOKEN}"
-    if [ "${USE_WORKER_PROXY}" = "true" ]; then
-        echo "https://telegram.behzad.workers.dev/bot${BOT_TOKEN}"
-    fi
+    echo "https://telegram.behzad.workers.dev/bot${BOT_TOKEN}"
 }
 
 tg_post_json() {
@@ -5074,7 +5074,7 @@ tg_post_json() {
 
     # 1) SOCKS5 (if enabled)
     if [ "${USE_SOCKS5}" = "true" ] && [ -n "${SOCKS5_PROXY}" ]; then
-        response=$(curl -4 -s --max-time 12 --socks5-hostname "${SOCKS5_PROXY}" \
+        response=$(curl -s --max-time 12 --socks5-hostname "${SOCKS5_PROXY}" \
             -X POST "https://api.telegram.org/bot${BOT_TOKEN}/${method}" \
             -H "Content-Type: application/json" \
             -d "$payload" 2>&1) || true
@@ -5086,7 +5086,7 @@ tg_post_json() {
     # 2) Try bases (workers + direct) without proxy
     if [ $ok -ne 0 ]; then
         while read -r base; do
-            response=$(curl -4 -s --max-time 12 \
+            response=$(curl -s --max-time 12 \
                 -X POST "${base}/${method}" \
                 -H "Content-Type: application/json" \
                 -d "$payload" 2>&1) || true
@@ -5108,7 +5108,7 @@ tg_get() {
     local ok=1
 
     if [ "${USE_SOCKS5}" = "true" ] && [ -n "${SOCKS5_PROXY}" ]; then
-        response=$(curl -4 -s --max-time 25 --socks5-hostname "${SOCKS5_PROXY}" \
+        response=$(curl -s --max-time 25 --socks5-hostname "${SOCKS5_PROXY}" \
             "https://api.telegram.org/bot${BOT_TOKEN}/${method_qs}" 2>&1) || true
         if echo "$response" | grep -q '"ok":true'; then
             ok=0
@@ -5117,7 +5117,7 @@ tg_get() {
 
     if [ $ok -ne 0 ]; then
         while read -r base; do
-            response=$(curl -4 -s --max-time 25 "${base}/${method_qs}" 2>&1) || true
+            response=$(curl -s --max-time 25 "${base}/${method_qs}" 2>&1) || true
             if echo "$response" | grep -q '"ok":true'; then
                 ok=0
                 break
@@ -5182,7 +5182,7 @@ answer_callback() {
 # -----------------------------
 list_paqet_services() {
     local units
-    units=$(systemctl list-unit-files "paqet-*.service" --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^paqet-.*\.service$' || true)
+    units=$(systemctl list-unit-files "paqet*.service" --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^paqet.*\.service$' || true)
     if [ -n "$units" ]; then
         echo "$units"
         return 0
@@ -5195,6 +5195,27 @@ list_paqet_services() {
 
 svc_state() { systemctl is-active "$1" 2>/dev/null || echo "unknown"; }
 svc_enabled() { systemctl is-enabled "$1" 2>/dev/null || echo "unknown"; }
+normalize_unit() {
+    local u="$1"
+    # ensure systemd unit has .service suffix
+    if [[ "$u" != *.service ]]; then
+        echo "${u}.service"
+    else
+        echo "$u"
+    fi
+}
+
+html_escape() {
+    # Escape text for Telegram HTML parse_mode
+    sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
+svc_status_detail() {
+    local unit
+    unit="$(normalize_unit "$1")"
+    # 20 lines is usually enough; avoid huge messages
+    systemctl status "$unit" --no-pager -l 2>/dev/null | head -n 20 | html_escape
+}
 
 format_all_status() {
     local out="📊 <b>وضعیت سرویس‌ها</b>\n\n"
@@ -5219,7 +5240,15 @@ format_all_status() {
 # Cronjob helpers (per-service)
 # -----------------------------
 cron_expr_for() {
-    case "$1" in
+    local v="$1"
+    # Allow numeric minutes (e.g., 1..59)
+    if [[ "$v" =~ ^[0-9]+$ ]]; then
+        if [ "$v" -ge 1 ] && [ "$v" -le 59 ]; then
+            echo "*/${v} * * * *"
+            return 0
+        fi
+    fi
+    case "$v" in
         1min) echo "*/1 * * * *" ;;
         5min) echo "*/5 * * * *" ;;
         15min) echo "*/15 * * * *" ;;
@@ -5231,8 +5260,11 @@ cron_expr_for() {
     esac
 }
 
+
 cron_current() {
     local unit="$1"
+    unit="$(normalize_unit "$unit")"
+    unit="$(normalize_unit "$unit")"
     local cmd="systemctl restart ${unit}"
     crontab -l 2>/dev/null | grep -F "$cmd" | head -1 || true
 }
@@ -5244,6 +5276,8 @@ cron_set() {
     expr=$(cron_expr_for "$interval")
     [ -z "$expr" ] && return 1
 
+    unit="$(normalize_unit "$unit")"
+    unit="$(normalize_unit "$unit")"
     local cmd="systemctl restart ${unit}"
     local line="${expr} ${cmd}"
 
@@ -5255,6 +5289,8 @@ cron_set() {
 
 cron_remove() {
     local unit="$1"
+    unit="$(normalize_unit "$unit")"
+    unit="$(normalize_unit "$unit")"
     local cmd="systemctl restart ${unit}"
     if crontab -l 2>/dev/null | grep -Fq "$cmd"; then
         crontab -l 2>/dev/null | grep -Fv "$cmd" | crontab - 2>/dev/null || true
@@ -5294,29 +5330,31 @@ JSON
 }
 
 kb_services_list() {
-    # Build dynamic keyboard from paqet-*.service units (2 per row)
-    local units=()
+    local kb='{"inline_keyboard":['
+    local i=0
     while read -r u; do
-        [ -n "$u" ] && units+=("$u")
+        [ -z "$u" ] && continue
+        local short="${u%.service}"
+        if [ $((i%2)) -eq 0 ]; then
+            kb+='['
+        else
+            kb+=','
+        fi
+        kb+='{"text":"'"${short}"'","callback_data":"svc:'"${u}"':menu"}'
+        if [ $((i%2)) -eq 1 ]; then
+            kb+='],'
+        fi
+        i=$((i+1))
     done < <(list_paqet_services)
 
-    # Convert to JSON array safely
-    local units_json
-    units_json=$(printf '%s
-' "${units[@]}" | jq -R . | jq -s .)
+    if [ $((i%2)) -eq 1 ]; then
+        kb+=']'
+        kb+=','
+    fi
 
-    jq -nc --argjson units "$units_json" '
-        def rows($arr):
-            [range(0; ($arr|length); 2) as $i |
-                ($arr[$i:$i+2]
-                    | map({
-                        text: (.|sub("\.service$"; "")),
-                        callback_data: ("svc:" + . + ":menu")
-                    })
-                )
-            ];
-        {inline_keyboard: (rows($units) + [[{text:"🏠 منوی اصلی", callback_data:"menu:home"}]])}
-    '
+    kb+='[{"text":"🏠 منوی اصلی","callback_data":"menu:home"}]]}'
+    kb=$(echo "$kb" | sed 's/,\]/\]/g; s/,\]\]/\]\]/g; s/,\]\]}/\]\]}/g; s/,\]}$/]}')
+    echo "$kb"
 }
 
 kb_service_panel() {
@@ -5393,6 +5431,7 @@ page_cron() {
 # -----------------------------
 do_service_action() {
     local unit="$1"
+    unit="$(normalize_unit "$unit")"
     local action="$2"
 
     case "$action" in
@@ -5510,9 +5549,18 @@ handle_callback() {
             local act="${tmp#*:}"
             do_service_action "$unit" "$act"
             local note="✅ انجام شد."
-            [ "$act" = "status" ] && note=""
-            edit_message "$chat_id" "$message_id" "$(page_service "$unit")\n${note}" "$(kb_service_panel "$unit")"
-            ;;
+            if [ "$act" = "status" ]; then
+                local details
+                details="$(svc_status_detail "$unit")"
+                edit_message "$chat_id" "$message_id" "$(page_service "$unit")
+
+<pre>${details}</pre>" "$(kb_service_panel "$unit")"
+            else
+                local note="✅ انجام شد."
+                edit_message "$chat_id" "$message_id" "$(page_service "$unit")
+${note}" "$(kb_service_panel "$unit")"
+            fi
+;;
         cron:*.service:menu)
             local unit="${data#cron:}"
             unit="${unit%:menu}"
@@ -5702,66 +5750,47 @@ remove_bot() {
     pause
 }
 
+
+# ================================================
+# Install Telegram bot prerequisites (quiet)
+# ================================================
+install_bot_prereqs_quiet() {
+    local os
+    os=$(detect_os)
+    case $os in
+        ubuntu|debian)
+            apt-get update -qq >/dev/null 2>&1 || true
+            apt-get install -y curl jq cron ca-certificates >/dev/null 2>&1 || true
+            ;;
+        centos|rhel|fedora|rocky|almalinux)
+            if command -v yum >/dev/null 2>&1; then
+                yum install -y curl jq cronie ca-certificates >/dev/null 2>&1 || true
+            elif command -v dnf >/dev/null 2>&1; then
+                dnf install -y curl jq cronie ca-certificates >/dev/null 2>&1 || true
+            fi
+            ;;
+        *)
+            :
+            ;;
+    esac
+}
+
 # ================================================
 # BOT SETUP WIZARD
 # ================================================
-
-# Ensure minimal prerequisites for Telegram bot are installed (curl + jq)
-ensure_bot_prereqs() {
-    local missing=()
-    command -v curl >/dev/null 2>&1 || missing+=("curl")
-    command -v jq >/dev/null 2>&1 || missing+=("jq")
-
-    if [ ${#missing[@]} -eq 0 ]; then
-        return 0
-    fi
-
-    print_warning "Missing bot prerequisites: ${missing[*]}"
-    local os
-    os=$(detect_os)
-
-    case "$os" in
-        ubuntu|debian)
-            apt update -qq >/dev/null 2>&1 || true
-            apt install -y "${missing[@]}" >/dev/null 2>&1 || return 1
-            ;;
-        centos|rhel|fedora|rocky|almalinux)
-            yum install -y "${missing[@]}" >/dev/null 2>&1 || return 1
-            ;;
-        *)
-            print_error "Unknown OS. Please install manually: ${missing[*]}"
-            return 1
-            ;;
-    esac
-
-    return 0
-}
-
-telegram_direct_access_ok() {
-    # Returns 0 if direct Telegram API works for given token
-    local token="$1"
-    [ -z "$token" ] && return 1
-    curl -4 -s --max-time 6 "https://api.telegram.org/bot${token}/getMe" | grep -q '"ok":true'
-}
-
 setup_bot_wizard() {
     clear
     show_banner
+
+    # Ensure bot prerequisites
+    install_bot_prereqs_quiet
     echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${GREEN}║              🤖 Telegram Bot Setup Wizard                    ║${NC}"
     echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}\n"
     
     print_step "This wizard will configure and start the Telegram bot in one go"
     echo ""
-
-    # Ensure minimal prerequisites for bot (curl + jq)
-    if ! ensure_bot_prereqs; then
-        print_error "Failed to install required packages (curl/jq)."
-        pause
-        return
-    fi
-    echo ""
-
+    
     # 1. Get Bot Token
     print_input "Step 1: Enter your Bot Token"
     echo -e "${CYAN}How to get:${NC}"
@@ -5838,7 +5867,7 @@ setup_bot_wizard() {
         local updates=""
         updates=$(curl -4 -s --max-time 10 "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?limit=10" 2>/dev/null)
         if ! echo "$updates" | grep -q '"ok":true'; then
-            updates=$(curl -4 -s --max-time 10 "https://telegram.behzad.workers.dev/bot${BOT_TOKEN}/getUpdates?limit=10" 2>/dev/null)
+            updates=$(curl -s --max-time 10 "https://telegram.behzad.workers.dev/bot${BOT_TOKEN}/getUpdates?limit=10" 2>/dev/null)
         fi
 
         if command -v jq &>/dev/null; then
@@ -5866,54 +5895,40 @@ setup_bot_wizard() {
     print_success "Chat ID saved"
     echo ""
 
-    print_input "Step 3: Telegram connectivity (Proxy optional)"
-    echo -e "${CYAN}Testing direct Telegram API access...${NC}"
-
-    if telegram_direct_access_ok "$BOT_TOKEN"; then
-        print_success "Direct Telegram access detected ✅ (no proxy needed)"
-        USE_SOCKS5="false"
-        SOCKS5_PROXY=""
-        USE_WORKER_PROXY="false"
-        echo ""
+    print_input "Step 3: Configuring SOCKS5 proxy for Telegram"
+    echo -e "${CYAN}Checking existing client configs for SOCKS5...${NC}"
+    
+    # Try to detect existing SOCKS5
+    local detected_proxy=$(detect_socks5_proxy)
+    
+    if [ -n "$detected_proxy" ]; then
+        SOCKS5_PROXY="$detected_proxy"
+        print_success "Found existing SOCKS5 proxy: $SOCKS5_PROXY"
+        USE_SOCKS5="true"
     else
-        print_warning "Direct Telegram access failed (blocked or no route)."
-        echo -e "${CYAN}Checking existing client configs for SOCKS5...${NC}"
-
-        # Try to detect existing SOCKS5
-        local detected_proxy=$(detect_socks5_proxy)
-
-        if [ -n "$detected_proxy" ]; then
-            SOCKS5_PROXY="$detected_proxy"
-            print_success "Found existing SOCKS5 proxy: $SOCKS5_PROXY"
-            USE_SOCKS5="true"
-        else
-            print_warning "No SOCKS5 proxy found in client configs"
-            read_confirm "Add SOCKS5 proxy to first client? (recommended)" add_socks5 "y"
-
-            if [ "$add_socks5" = "true" ]; then
-                local added_proxy=$(add_socks5_to_client)
-                if [ -n "$added_proxy" ]; then
-                    SOCKS5_PROXY="$added_proxy"
-                    print_success "SOCKS5 proxy added: $SOCKS5_PROXY"
-                    USE_SOCKS5="true"
-                else
-                    print_error "Failed to add SOCKS5 proxy"
-                    USE_SOCKS5="false"
-                    SOCKS5_PROXY=""
-                fi
+        print_warning "No SOCKS5 proxy found in client configs"
+        read_confirm "Add SOCKS5 proxy to first client? (recommended)" add_socks5 "y"
+        
+        if [ "$add_socks5" = "true" ]; then
+            local added_proxy=$(add_socks5_to_client)
+            if [ -n "$added_proxy" ]; then
+                SOCKS5_PROXY="$added_proxy"
+                print_success "SOCKS5 proxy added: $SOCKS5_PROXY"
+                USE_SOCKS5="true"
             else
-                print_info "Continuing without SOCKS5 proxy"
+                print_error "Failed to add SOCKS5 proxy"
                 USE_SOCKS5="false"
                 SOCKS5_PROXY=""
             fi
+        else
+            print_info "Continuing without SOCKS5 proxy"
+            USE_SOCKS5="false"
+            SOCKS5_PROXY=""
         fi
-
-        # Optional Workers proxy fallback (off by default)
-        read_confirm "Enable Workers proxy fallback? (only if Telegram is blocked)" USE_WORKER_PROXY "n"
-        echo ""
     fi
-
-# 4. Ask for notification preferences
+    echo ""
+    
+    # 4. Ask for notification preferences
     print_input "Step 4: Configure notification settings"
     read_confirm "Enable boot reports? (recommended)" ENABLE_BOOT_REPORT "y"
     read_confirm "Enable service status monitoring?" ENABLE_SERVICE_WATCH "y"
