@@ -44,7 +44,6 @@ show_banner() {
     echo "║          Raw Packet Tunnel - Firewall Bypass                 ║"
     echo "║                                 Manager v3.8                 ║"
     echo "║                                                              ║"
-    echo "║          https://t.me/behzad_developer                       ║"
     echo "║          https://github.com/0fariid0                         ║"    
     echo "║                                                              ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
