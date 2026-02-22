@@ -173,7 +173,7 @@ show_banner() {
     echo "║          Raw Packet Tunnel - Firewall Bypass                 ║"
     echo "║                                 Manager v${SCRIPT_VERSION}                 ║"
     echo "║                                                              ║"
-    echo "║          https://github.com/0fariid0                       ║"    
+    echo "║          https://github.com/0fariid0                         ║"    
     echo "║                                                              ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
@@ -5060,9 +5060,8 @@ load_config() {
 }
 
 tg_base_urls() {
-    # Order matters
+    # Direct Telegram API (recommended for inline keyboards)
     echo "https://api.telegram.org/bot${BOT_TOKEN}"
-    echo "https://telegram.behzad.workers.dev/bot${BOT_TOKEN}"
 }
 
 tg_post_json() {
@@ -5074,7 +5073,7 @@ tg_post_json() {
 
     # 1) SOCKS5 (if enabled)
     if [ "${USE_SOCKS5}" = "true" ] && [ -n "${SOCKS5_PROXY}" ]; then
-        response=$(curl -s --max-time 12 --socks5-hostname "${SOCKS5_PROXY}" \
+        response=$(curl -4 -s --max-time 12 --socks5-hostname "${SOCKS5_PROXY}" \
             -X POST "https://api.telegram.org/bot${BOT_TOKEN}/${method}" \
             -H "Content-Type: application/json" \
             -d "$payload" 2>&1) || true
@@ -5086,7 +5085,7 @@ tg_post_json() {
     # 2) Try bases (workers + direct) without proxy
     if [ $ok -ne 0 ]; then
         while read -r base; do
-            response=$(curl -s --max-time 12 \
+            response=$(curl -4 -s --max-time 12 \
                 -X POST "${base}/${method}" \
                 -H "Content-Type: application/json" \
                 -d "$payload" 2>&1) || true
@@ -5108,7 +5107,7 @@ tg_get() {
     local ok=1
 
     if [ "${USE_SOCKS5}" = "true" ] && [ -n "${SOCKS5_PROXY}" ]; then
-        response=$(curl -s --max-time 25 --socks5-hostname "${SOCKS5_PROXY}" \
+        response=$(curl -4 -s --max-time 25 --socks5-hostname "${SOCKS5_PROXY}" \
             "https://api.telegram.org/bot${BOT_TOKEN}/${method_qs}" 2>&1) || true
         if echo "$response" | grep -q '"ok":true'; then
             ok=0
@@ -5117,7 +5116,7 @@ tg_get() {
 
     if [ $ok -ne 0 ]; then
         while read -r base; do
-            response=$(curl -s --max-time 25 "${base}/${method_qs}" 2>&1) || true
+            response=$(curl -4 -s --max-time 25 "${base}/${method_qs}" 2>&1) || true
             if echo "$response" | grep -q '"ok":true'; then
                 ok=0
                 break
@@ -5181,23 +5180,13 @@ answer_callback() {
 # Paqet helpers
 # -----------------------------
 list_paqet_services() {
-    local units
-    units=$(systemctl list-unit-files "paqet*.service" --no-legend 2>/dev/null | awk '{print $1}' | grep -E '^paqet.*\.service$' || true)
-    if [ -n "$units" ]; then
-        echo "$units"
-        return 0
-    fi
-
-    if [ -d "/etc/paqet" ]; then
-        find "/etc/paqet" -maxdepth 1 -type f -name "*.yaml" -printf "paqet-%f\n" 2>/dev/null | sed 's/\.yaml$/.service/' | sort -u
-    fi
+    systemctl list-unit-files --type=service --no-legend "paqet*" 2>/dev/null \
+        | awk '{print $1}' \
+        | sed '/^$/d'
 }
 
-svc_state() { systemctl is-active "$1" 2>/dev/null || echo "unknown"; }
-svc_enabled() { systemctl is-enabled "$1" 2>/dev/null || echo "unknown"; }
 normalize_unit() {
     local u="$1"
-    # ensure systemd unit has .service suffix
     if [[ "$u" != *.service ]]; then
         echo "${u}.service"
     else
@@ -5206,16 +5195,19 @@ normalize_unit() {
 }
 
 html_escape() {
-    # Escape text for Telegram HTML parse_mode
     sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
 }
 
 svc_status_detail() {
     local unit
     unit="$(normalize_unit "$1")"
-    # 20 lines is usually enough; avoid huge messages
     systemctl status "$unit" --no-pager -l 2>/dev/null | head -n 20 | html_escape
 }
+
+
+
+svc_state() { systemctl is-active "$1" 2>/dev/null || echo "unknown"; }
+svc_enabled() { systemctl is-enabled "$1" 2>/dev/null || echo "unknown"; }
 
 format_all_status() {
     local out="📊 <b>وضعیت سرویس‌ها</b>\n\n"
@@ -5241,7 +5233,6 @@ format_all_status() {
 # -----------------------------
 cron_expr_for() {
     local v="$1"
-    # Allow numeric minutes (e.g., 1..59)
     if [[ "$v" =~ ^[0-9]+$ ]]; then
         if [ "$v" -ge 1 ] && [ "$v" -le 59 ]; then
             echo "*/${v} * * * *"
@@ -5260,11 +5251,8 @@ cron_expr_for() {
     esac
 }
 
-
 cron_current() {
     local unit="$1"
-    unit="$(normalize_unit "$unit")"
-    unit="$(normalize_unit "$unit")"
     local cmd="systemctl restart ${unit%.service}"
     crontab -l 2>/dev/null | grep -F "$cmd" | head -1 || true
 }
@@ -5276,8 +5264,6 @@ cron_set() {
     expr=$(cron_expr_for "$interval")
     [ -z "$expr" ] && return 1
 
-    unit="$(normalize_unit "$unit")"
-    unit="$(normalize_unit "$unit")"
     local cmd="systemctl restart ${unit%.service}"
     local line="${expr} ${cmd}"
 
@@ -5289,8 +5275,6 @@ cron_set() {
 
 cron_remove() {
     local unit="$1"
-    unit="$(normalize_unit "$unit")"
-    unit="$(normalize_unit "$unit")"
     local cmd="systemctl restart ${unit%.service}"
     if crontab -l 2>/dev/null | grep -Fq "$cmd"; then
         crontab -l 2>/dev/null | grep -Fv "$cmd" | crontab - 2>/dev/null || true
@@ -5330,31 +5314,21 @@ JSON
 }
 
 kb_services_list() {
-    local kb='{"inline_keyboard":['
-    local i=0
-    while read -r u; do
-        [ -z "$u" ] && continue
-        local short="${u%.service}"
-        if [ $((i%2)) -eq 0 ]; then
-            kb+='['
-        else
-            kb+=','
-        fi
-        kb+='{"text":"'"${short}"'","callback_data":"svc:'"${u}"':menu"}'
-        if [ $((i%2)) -eq 1 ]; then
-            kb+='],'
-        fi
-        i=$((i+1))
-    done < <(list_paqet_services)
+    local units_json
+    units_json="$(list_paqet_services | jq -R . | jq -s .)"
 
-    if [ $((i%2)) -eq 1 ]; then
-        kb+=']'
-        kb+=','
-    fi
-
-    kb+='[{"text":"🏠 منوی اصلی","callback_data":"menu:home"}]]}'
-    kb=$(echo "$kb" | sed 's/,\]/\]/g; s/,\]\]/\]\]/g; s/,\]\]}/\]\]}/g; s/,\]}$/]}')
-    echo "$kb"
+    jq -nc --argjson units "$units_json" '
+        def rows($arr):
+            [range(0; ($arr|length); 2) as $i |
+                ($arr[$i:$i+2]
+                    | map({
+                        text: (.|rtrimstr(".service")),
+                        callback_data: ("svc:" + . + ":menu")
+                    })
+                )
+            ];
+        {inline_keyboard: (rows($units) + [[{text:"🏠 منوی اصلی", callback_data:"menu:home"}]])}
+    '
 }
 
 kb_service_panel() {
@@ -5548,7 +5522,6 @@ handle_callback() {
             local unit="${tmp%%:*}"
             local act="${tmp#*:}"
             do_service_action "$unit" "$act"
-            local note="✅ انجام شد."
             if [ "$act" = "status" ]; then
                 local details
                 details="$(svc_status_detail "$unit")"
@@ -5749,7 +5722,6 @@ remove_bot() {
     print_success "✅ Bot uninstalled successfully"
     pause
 }
-
 
 # ================================================
 # Install Telegram bot prerequisites (quiet)
