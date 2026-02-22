@@ -4,7 +4,7 @@
 # Version: 6.0 (Fully Refactored)
 # Raw packet-level tunneling for bypassing network restrictions
 # GitHub: https://github.com/hanselime/paqet
-# Manager GitHub: https://github.com/behzadea12/Paqet-Tunnel-Manager
+# Manager GitHub: https://github.com/0fariid0/Paqet-Tunnel-Manager
 #=================================================
 
 # ================================================
@@ -37,7 +37,7 @@ readonly BACKUP_DIR="/root/paqet-backups"
 
 # Repositories
 readonly GITHUB_REPO="hanselime/paqet"
-readonly MANAGER_GITHUB_REPO="behzadea12/Paqet-Tunnel-Manager"
+readonly MANAGER_GITHUB_REPO="0fariid0/Paqet-Tunnel-Manager"
 readonly SERVICE_NAME="paqet"
 
 # Kernel optimization settings
@@ -132,9 +132,9 @@ readonly COMMON_PORTS=("443" "80" "22" "53")
 
 # Manager versions for switch option
 declare -A MANAGER_VERSIONS=(
-    ["latest"]="https://raw.githubusercontent.com/behzadea12/Paqet-Tunnel-Manager/main/paqet-manager.sh"
-    ["5.1"]="https://raw.githubusercontent.com/behzadea12/Paqet-Tunnel-Manager/main/paqet-manager5-1.sh"
-    ["3.8"]="https://raw.githubusercontent.com/behzadea12/Paqet-Tunnel-Manager/main/paqet-manager3-8.sh"
+    ["latest"]="https://raw.githubusercontent.com/0fariid0/Paqet-Tunnel-Manager/main/paqet-manager.sh"
+    ["5.1"]="https://raw.githubusercontent.com/0fariid0/Paqet-Tunnel-Manager/main/paqet-manager5-1.sh"
+    ["3.8"]="https://raw.githubusercontent.com/0fariid0/Paqet-Tunnel-Manager/main/paqet-manager3-8.sh"
 )
 
 # ================================================
@@ -172,8 +172,7 @@ show_banner() {
     echo "║          Raw Packet Tunnel - Firewall Bypass                 ║"
     echo "║                                 Manager v${SCRIPT_VERSION}                 ║"
     echo "║                                                              ║"
-    echo "║          https://t.me/behzad_developer                       ║"
-    echo "║          https://github.com/behzadea12                       ║"    
+    echo "║          https://github.com/0fariid0                         ║"    
     echo "║                                                              ║"
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
