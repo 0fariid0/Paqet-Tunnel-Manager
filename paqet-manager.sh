@@ -170,7 +170,7 @@ show_banner() {
     echo "║     ██║     ██║  ██║╚██████╔╝███████╗   ██║                  ║"
     echo "║     ╚═╝     ╚═╝  ╚═╝ ╚══▀▀═╝ ╚══════╝   ╚═╝                  ║"
     echo "║                                                              ║"
-    echo "║          Raw Packet Tunnel - Firewall Bypass                 ║"
+    echo "║          Raw Packet Tunnel-- Firewall Bypass                 ║"
     echo "║                                 Manager v${SCRIPT_VERSION}                 ║"
     echo "║                                                              ║"
     echo "║          https://github.com/0fariid0                         ║"    
@@ -491,31 +491,6 @@ configure_iptables() {
     save_iptables
 }
 
-
-# Remove iptables rules for a port/protocol (best-effort cleanup)
-remove_iptables_rules() {
-    local port="$1"
-    local protocol="$2"
-
-    if ! command -v iptables &>/dev/null; then
-        return 0
-    fi
-
-    local protocols=()
-    [ "$protocol" = "both" ] && protocols=("tcp" "udp") || protocols=("$protocol")
-
-    for proto in "${protocols[@]}"; do
-        iptables -t raw -D PREROUTING -p "$proto" --dport "$port" -j NOTRACK 2>/dev/null || true
-        iptables -t raw -D OUTPUT -p "$proto" --sport "$port" -j NOTRACK 2>/dev/null || true
-
-        if [ "$proto" = "tcp" ]; then
-            iptables -t mangle -D OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null || true
-        fi
-    done
-
-    type save_iptables &>/dev/null && save_iptables || true
-}
-
 # Create systemd service
 create_systemd_service() {
     local config_name="$1"
@@ -685,688 +660,6 @@ get_service_details() {
     echo "$type $mode $mtu $conn $cron"
 }
 
-# ================================================
-# QUICK CONFIG EDIT (IP/PORTS) - SAFE & EASY
-# ================================================
-
-# Create a safe backup of any config before editing
-backup_config_file() {
-    local cfg="$1"
-    mkdir -p "$BACKUP_DIR" 2>/dev/null || true
-    local base
-    base=$(basename "$cfg")
-    local backup_path="${BACKUP_DIR}/${base}.backup-$(date +%Y%m%d-%H%M%S)"
-    if cp "$cfg" "$backup_path" 2>/dev/null; then
-        print_info "Backup created: $backup_path"
-        echo "$backup_path"
-        return 0
-    fi
-    print_warning "Could not create backup for $cfg"
-    return 1
-}
-
-# Validate host (IPv4 or hostname)
-validate_host() {
-    local host="$1"
-    validate_ip "$host" && return 0
-    # Allow simple hostnames/domains
-    [[ "$host" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$ ]]
-}
-
-# Read role from YAML
-yaml_get_role() {
-    local cfg="$1"
-    grep "^role:" "$cfg" 2>/dev/null | awk '{print $2}' | tr -d '"' | head -1
-}
-
-# Extract server listen port from server config
-yaml_get_listen_port() {
-    local cfg="$1"
-    awk '
-        /^listen:/ {insec=1; next}
-        insec && match($0, /addr:[[:space:]]*":[0-9]+"/) {
-            gsub(/.*":[[:space:]]*/, "", $0)
-            gsub(/".*/, "", $0)
-            print $0; exit
-        }
-        insec && /^[^[:space:]]/ {insec=0}
-    ' "$cfg" 2>/dev/null
-}
-
-# Extract client server addr (host:port)
-yaml_get_server_addr() {
-    local cfg="$1"
-    awk '
-        /^server:/ {insec=1; next}
-        insec && match($0, /addr:[[:space:]]*"[^"]+"/) {
-            sub(/.*addr:[[:space:]]*"/, "", $0)
-            sub(/".*/, "", $0)
-            print $0; exit
-        }
-        insec && /^[^[:space:]]/ {insec=0}
-    ' "$cfg" 2>/dev/null
-}
-
-# Extract SOCKS5 listen (ip:port)
-yaml_get_socks5_listen() {
-    local cfg="$1"
-    awk '
-        /^socks5:/ {insec=1; next}
-        insec && match($0, /listen:[[:space:]]*"[^"]+"/) {
-            sub(/.*listen:[[:space:]]*"/, "", $0)
-            sub(/".*/, "", $0)
-            print $0; exit
-        }
-        insec && /^[^[:space:]]/ {insec=0}
-    ' "$cfg" 2>/dev/null
-}
-
-# List forward entries as: "<port> <proto>" (one line per YAML item)
-yaml_list_forward_entries() {
-    local cfg="$1"
-    awk '
-        /^forward:/ {insec=1; next}
-        insec && match($0, /listen:[[:space:]]*"0\.0\.0\.0:([0-9]+)"/, a) {port=a[1]}
-        insec && match($0, /protocol:[[:space:]]*"([a-z]+)"/, b) {
-            if (port != "") { print port " " b[1]; port="" }
-        }
-        insec && /^[^[:space:]]/ {insec=0}
-    ' "$cfg" 2>/dev/null
-}
-
-# Extract forward target host (from first target line)
-yaml_get_forward_target_host() {
-    local cfg="$1"
-    awk '
-        /^forward:/ {insec=1; next}
-        insec && match($0, /target:[[:space:]]*"([^":]+):[0-9]+"/, a) {print a[1]; exit}
-        insec && /^[^[:space:]]/ {insec=0}
-    ' "$cfg" 2>/dev/null
-}
-
-# Find section range in YAML: prints "start end" where end is the first line AFTER the section
-yaml_section_range() {
-    local cfg="$1"
-    local section="$2"
-    local start
-    start=$(grep -n "^${section}:" "$cfg" 2>/dev/null | head -1 | cut -d: -f1)
-    [ -z "$start" ] && return 1
-    local end
-    end=$(awk -v s="$start" 'NR>s && $0 ~ /^[^[:space:]]/ {print NR; found=1; exit} END{ if(!found) print NR+1 }' "$cfg")
-    echo "$start $end"
-}
-
-# Replace (or remove) the "forward:" section atomically
-yaml_set_forward_section() {
-    local cfg="$1"
-    shift
-    local -a new_lines=("$@")   # lines WITHOUT the top-level "forward:"
-    local range
-    range=$(yaml_section_range "$cfg" "forward") || {
-        # no forward section; if new_lines is empty we do nothing
-        if [ ${#new_lines[@]} -eq 0 ]; then return 0; fi
-        # insert forward section before "network:" if possible, otherwise append
-        local tmp
-        tmp=$(mktemp)
-        if grep -q "^network:" "$cfg"; then
-            local net_line
-            net_line=$(grep -n "^network:" "$cfg" | head -1 | cut -d: -f1)
-            head -n $((net_line-1)) "$cfg" > "$tmp"
-            echo "forward:" >> "$tmp"
-            printf "%s\n" "${new_lines[@]}" >> "$tmp"
-            tail -n +"$net_line" "$cfg" >> "$tmp"
-        else
-            cat "$cfg" > "$tmp"
-            echo "forward:" >> "$tmp"
-            printf "%s\n" "${new_lines[@]}" >> "$tmp"
-        fi
-        mv "$tmp" "$cfg"
-        return 0
-    }
-
-    local start end
-    start=$(echo "$range" | awk '{print $1}')
-    end=$(echo "$range" | awk '{print $2}')
-
-    local tmp
-    tmp=$(mktemp)
-
-    head -n $((start-1)) "$cfg" > "$tmp"
-
-    if [ ${#new_lines[@]} -gt 0 ]; then
-        echo "forward:" >> "$tmp"
-        printf "%s\n" "${new_lines[@]}" >> "$tmp"
-    fi
-
-    local total
-    total=$(wc -l < "$cfg" 2>/dev/null || echo 0)
-    if [ "$end" -le $((total+1)) ]; then
-        tail -n +"$end" "$cfg" >> "$tmp"
-    fi
-
-    mv "$tmp" "$cfg"
-}
-
-# Update server listen port in server config (listen.addr + network.ipv4.addr)
-yaml_set_server_listen_port() {
-    local cfg="$1"
-    local new_port="$2"
-
-    local tmp
-    tmp=$(mktemp)
-
-    # Update listen addr within listen section
-    sed -E '/^listen:/,/^[^[:space:]]/ s/(addr:[[:space:]]*"):[0-9]+"/\1:'"$new_port"'"/' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
-
-    # Update network ipv4 addr port (only if pattern looks like x.x.x.x:PORT)
-    tmp=$(mktemp)
-    sed -E 's/(addr:[[:space:]]*"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:)[0-9]+"/\1'"$new_port"'"/' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
-}
-
-# Update client server endpoint "server.addr"
-yaml_set_client_server_addr() {
-    local cfg="$1"
-    local new_addr="$2" # host:port
-    local tmp
-    tmp=$(mktemp)
-    sed -E '/^server:/,/^[^[:space:]]/ s/(addr:[[:space:]]*")[^"]+(")/\1'"$new_addr"'\2/' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
-}
-
-# Update socks5 listen ip/port inside socks5 section
-yaml_set_socks5_listen() {
-    local cfg="$1"
-    local new_ip="$2"
-    local new_port="$3"
-    local tmp
-    tmp=$(mktemp)
-    sed -E '/^socks5:/,/^[^[:space:]]/ s/(listen:[[:space:]]*")[^"]+(")/\1'"$new_ip:$new_port"'\2/' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
-}
-
-# Validate forward loop risk (no forwarded port equals tunnel port)
-validate_forward_loop() {
-    local srv_port="$1"
-    local ports_csv="$2"
-    local p
-    IFS=',' read -ra __P <<< "$ports_csv"
-    for p in "${__P[@]}"; do
-        p=$(echo "$p" | tr -d '[:space:]')
-        if validate_port "$p" && [ "$p" = "$srv_port" ]; then
-            return 1
-        fi
-    done
-    return 0
-}
-
-# Quick edit UI for a specific service config
-quick_edit_ip_ports() {
-    local cfg="$1"
-    local selected_service="$2"
-
-    if [ ! -f "$cfg" ]; then
-        print_error "Config file not found: $cfg"
-        return 1
-    fi
-
-    local role
-    role=$(yaml_get_role "$cfg")
-    role="${role:-unknown}"
-
-    local did_backup="0"
-
-    while true; do
-        clear
-        show_banner
-        echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
-        printf "${GREEN}║ Quick Edit IP/Ports: %-40s ║${NC}\n" "$(basename "$cfg")"
-        echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}\n"
-
-        echo -e "${CYAN}Detected Role:${NC} ${YELLOW}${role}${NC}\n"
-
-        if [ "$role" = "server" ]; then
-            local cur_port
-            cur_port=$(yaml_get_listen_port "$cfg")
-            echo -e "${CYAN}Current Listen Port:${NC} ${YELLOW}${cur_port:-?}${NC}\n"
-
-            echo -e "${CYAN}Actions${NC}"
-            echo " 1. Change listen port"
-            echo " 2. Open full config in editor"
-            echo " 0. Back"
-            echo ""
-            read -p "Choose [0-2]: " ch
-
-            case "$ch" in
-                0) return 0 ;;
-                1)
-                    local new_port
-                    read -p "New listen port (current ${cur_port:-?}): " new_port
-                    new_port="${new_port:-$cur_port}"
-
-                    if ! validate_port "$new_port"; then
-                        print_error "Invalid port"
-                        pause
-                        continue
-                    fi
-                    if ! check_port_conflict "$new_port"; then
-                        pause
-                        continue
-                    fi
-
-                    [ "$did_backup" = "0" ] && backup_config_file "$cfg" >/dev/null 2>&1 && did_backup="1"
-
-                    # Update iptables (remove old tcp rules, add new)
-                    if [ -n "$cur_port" ] && validate_port "$cur_port"; then
-                        remove_iptables_rules "$cur_port" "tcp"
-                    fi
-                    configure_iptables "$new_port" "tcp"
-
-                    yaml_set_server_listen_port "$cfg" "$new_port"
-
-                    print_success "Listen port updated to $new_port"
-                    read -p "Restart service now? (y/N): " restart_choice
-                    if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
-                        systemctl restart "$selected_service" >/dev/null 2>&1
-                        systemctl is-active --quiet "$selected_service" && print_success "Service restarted" || print_error "Service failed to start"
-                    fi
-                    pause
-                    ;;
-                2)
-                    local editor="nano"
-                    command -v nano &>/dev/null || editor="vi"
-                    $editor "$cfg"
-                    read -p "Restart service to apply changes? (y/N): " restart_choice
-                    if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
-                        systemctl restart "$selected_service" >/dev/null 2>&1
-                        systemctl is-active --quiet "$selected_service" && print_success "Service restarted" || print_error "Service failed to start"
-                    fi
-                    pause
-                    ;;
-                *) print_error "Invalid choice"; sleep 1 ;;
-            esac
-
-        elif [ "$role" = "client" ]; then
-            local srv_addr srv_host srv_port
-            srv_addr=$(yaml_get_server_addr "$cfg")
-            srv_host="${srv_addr%:*}"
-            srv_port="${srv_addr##*:}"
-
-            local socks_listen socks_ip socks_port
-            socks_listen=$(yaml_get_socks5_listen "$cfg")
-            socks_ip="${socks_listen%:*}"
-            socks_port="${socks_listen##*:}"
-
-            echo -e "${CYAN}Current Server:${NC} ${YELLOW}${srv_addr:-?}${NC}"
-            if grep -q "^forward:" "$cfg" 2>/dev/null; then
-                echo -e "${CYAN}Forward Ports:${NC}"
-                local entries
-                entries=$(yaml_list_forward_entries "$cfg" | awk '{print $1"("$2")"}' | tr '\n' ' ')
-                echo -e "  ${YELLOW}${entries:-None}${NC}"
-            else
-                echo -e "${CYAN}Forward Ports:${NC} ${YELLOW}None${NC}"
-            fi
-
-            if grep -q "^socks5:" "$cfg" 2>/dev/null; then
-                echo -e "${CYAN}SOCKS5 Listen:${NC} ${YELLOW}${socks_listen:-?}${NC}"
-            else
-                echo -e "${CYAN}SOCKS5 Listen:${NC} ${YELLOW}None${NC}"
-            fi
-            echo ""
-
-            echo -e "${CYAN}Actions${NC}"
-            echo " 1. Change server IP/Port"
-            if grep -q "^forward:" "$cfg" 2>/dev/null; then
-                echo " 2. Manage forward ports"
-            else
-                echo " 2. Add forward ports"
-            fi
-            if grep -q "^socks5:" "$cfg" 2>/dev/null; then
-                echo " 3. Change SOCKS5 IP/Port"
-            fi
-            echo " 9. Open full config in editor"
-            echo " 0. Back"
-            echo ""
-            read -p "Choose: " ch
-
-            case "$ch" in
-                0) return 0 ;;
-                1)
-                    local new_host new_port
-                    read -p "Server host (current ${srv_host:-?}) [Enter=keep]: " new_host
-                    read -p "Server port (current ${srv_port:-?}) [Enter=keep]: " new_port
-                    new_host="${new_host:-$srv_host}"
-                    new_port="${new_port:-$srv_port}"
-
-                    if [ -z "$new_host" ] || ! validate_host "$new_host"; then
-                        print_error "Invalid server host"
-                        pause
-                        continue
-                    fi
-                    if ! validate_port "$new_port"; then
-                        print_error "Invalid server port"
-                        pause
-                        continue
-                    fi
-
-                    [ "$did_backup" = "0" ] && backup_config_file "$cfg" >/dev/null 2>&1 && did_backup="1"
-
-                    yaml_set_client_server_addr "$cfg" "${new_host}:${new_port}"
-                    print_success "Server endpoint updated to ${new_host}:${new_port}"
-
-                    read -p "Restart service now? (y/N): " restart_choice
-                    if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
-                        systemctl restart "$selected_service" >/dev/null 2>&1
-                        systemctl is-active --quiet "$selected_service" && print_success "Service restarted" || print_error "Service failed to start"
-                    fi
-                    pause
-                    ;;
-                2)
-                    # Forward ports manager (simple & safe)
-                    local target_host
-                    target_host=$(yaml_get_forward_target_host "$cfg")
-                    target_host="${target_host:-127.0.0.1}"
-
-                    declare -A protos
-                    while read -r p pr; do
-                        [ -z "$p" ] && continue
-                        if [ -z "${protos[$p]}" ]; then
-                            protos[$p]="$pr"
-                        else
-                            [ "${protos[$p]}" != "$pr" ] && protos[$p]="both"
-                        fi
-                    done < <(yaml_list_forward_entries "$cfg")
-
-                    # Show current
-                    echo ""
-                    echo -e "${YELLOW}Current forward rules:${NC}"
-                    if [ ${#protos[@]} -eq 0 ]; then
-                        echo "  (none)"
-                    else
-                        for p in $(printf "%s\n" "${!protos[@]}" | sort -n); do
-                            echo "  - $p (${protos[$p]^^}) → ${target_host}:$p"
-                        done | sort -n -k2 2>/dev/null || true
-                    fi
-                    echo ""
-
-                    echo -e "${CYAN}Forward actions${NC}"
-                    echo " 1. Replace/set ports list"
-                    echo " 2. Add a port"
-                    echo " 3. Remove port(s)"
-                    echo " 4. Change protocol for a port"
-                    echo " 5. Change target IP (currently ${target_host})"
-                    echo " 0. Back"
-                    read -p "Choose [0-5]: " fch
-
-                    if [ "$fch" = "0" ]; then
-                        continue
-                    fi
-
-                    # Save old for iptables cleanup
-                    local old_entries
-                    old_entries=$(yaml_list_forward_entries "$cfg")
-
-                    case "$fch" in
-                        1)
-                            local ports_csv
-                            read -p "Enter forward ports (comma separated, e.g. 443,8443): " ports_csv
-                            ports_csv=$(clean_port_list "$ports_csv")
-                            if [ -z "$ports_csv" ]; then
-                                print_error "No valid ports provided"
-                                pause
-                                continue
-                            fi
-
-                            # Loop prevention
-                            local cur_srv_addr cur_srv_port
-                            cur_srv_addr=$(yaml_get_server_addr "$cfg")
-                            cur_srv_port="${cur_srv_addr##*:}"
-                            if ! validate_forward_loop "$cur_srv_port" "$ports_csv"; then
-                                print_error "TRAFFIC LOOP RISK: a forward port equals tunnel port (${cur_srv_port})"
-                                print_info  "Choose different forward ports (e.g., 443, 2053, 8443...)"
-                                pause
-                                continue
-                            fi
-
-                            # Ask target host once
-                            local th
-                            read -p "Target IP for all forwards (default ${target_host}): " th
-                            th="${th:-$target_host}"
-                            if ! validate_host "$th"; then
-                                print_error "Invalid target IP/host"
-                                pause
-                                continue
-                            fi
-                            target_host="$th"
-
-                            # Reset protos map
-                            unset protos
-                            declare -A protos
-
-                            IFS=',' read -ra __PORTS <<< "$ports_csv"
-                            for p in "${__PORTS[@]}"; do
-                                p=$(echo "$p" | tr -d '[:space:]')
-                                echo ""
-                                echo "Port $p protocol:"
-                                echo " 1) TCP (default)"
-                                echo " 2) UDP"
-                                echo " 3) TCP+UDP"
-                                read -p "Choose [1-3]: " pc
-                                pc="${pc:-1}"
-                                case "$pc" in
-                                    2) protos[$p]="udp" ;;
-                                    3) protos[$p]="both" ;;
-                                    *) protos[$p]="tcp" ;;
-                                esac
-                            done
-                            ;;
-                        2)
-                            local p
-                            read -p "Port to add: " p
-                            if ! validate_port "$p"; then
-                                print_error "Invalid port"
-                                pause
-                                continue
-                            fi
-
-                            local cur_srv_addr cur_srv_port
-                            cur_srv_addr=$(yaml_get_server_addr "$cfg")
-                            cur_srv_port="${cur_srv_addr##*:}"
-                            if [ "$p" = "$cur_srv_port" ]; then
-                                print_error "TRAFFIC LOOP RISK: forward port equals tunnel port (${cur_srv_port})"
-                                pause
-                                continue
-                            fi
-
-                            echo "Protocol for $p:"
-                            echo " 1) TCP (default)"
-                            echo " 2) UDP"
-                            echo " 3) TCP+UDP"
-                            read -p "Choose [1-3]: " pc
-                            pc="${pc:-1}"
-                            case "$pc" in
-                                2) protos[$p]="udp" ;;
-                                3) protos[$p]="both" ;;
-                                *) protos[$p]="tcp" ;;
-                            esac
-                            ;;
-                        3)
-                            local rm_ports
-                            read -p "Ports to remove (comma separated): " rm_ports
-                            rm_ports=$(clean_port_list "$rm_ports")
-                            if [ -z "$rm_ports" ]; then
-                                print_error "No valid ports"
-                                pause
-                                continue
-                            fi
-                            IFS=',' read -ra __RM <<< "$rm_ports"
-                            for p in "${__RM[@]}"; do
-                                unset "protos[$p]"
-                            done
-                            ;;
-                        4)
-                            local p
-                            read -p "Port to change protocol: " p
-                            if [ -z "${protos[$p]}" ]; then
-                                print_error "Port not found in forward list"
-                                pause
-                                continue
-                            fi
-                            echo "New protocol for $p:"
-                            echo " 1) TCP"
-                            echo " 2) UDP"
-                            echo " 3) TCP+UDP"
-                            read -p "Choose [1-3]: " pc
-                            pc="${pc:-1}"
-                            case "$pc" in
-                                2) protos[$p]="udp" ;;
-                                3) protos[$p]="both" ;;
-                                *) protos[$p]="tcp" ;;
-                            esac
-                            ;;
-                        5)
-                            local th
-                            read -p "New target IP/host (current ${target_host}): " th
-                            th="${th:-$target_host}"
-                            if ! validate_host "$th"; then
-                                print_error "Invalid target"
-                                pause
-                                continue
-                            fi
-                            target_host="$th"
-                            ;;
-                        *) print_error "Invalid choice"; pause; continue ;;
-                    esac
-
-                    # Build new forward YAML lines
-                    local -a lines=()
-                    if [ ${#protos[@]} -gt 0 ]; then
-                        for p in $(printf "%s\n" "${!protos[@]}" | sort -n); do
-                            case "${protos[$p]}" in
-                                udp)
-                                    lines+=("  - listen: \"0.0.0.0:$p\"")
-                                    lines+=("    target: \"${target_host}:$p\"")
-                                    lines+=("    protocol: \"udp\"")
-                                    ;;
-                                both)
-                                    lines+=("  - listen: \"0.0.0.0:$p\"")
-                                    lines+=("    target: \"${target_host}:$p\"")
-                                    lines+=("    protocol: \"tcp\"")
-                                    lines+=("  - listen: \"0.0.0.0:$p\"")
-                                    lines+=("    target: \"${target_host}:$p\"")
-                                    lines+=("    protocol: \"udp\"")
-                                    ;;
-                                *)
-                                    lines+=("  - listen: \"0.0.0.0:$p\"")
-                                    lines+=("    target: \"${target_host}:$p\"")
-                                    lines+=("    protocol: \"tcp\"")
-                                    ;;
-                            esac
-                        done
-
-                        # Sort lines by port for readability
-                        # (Keep stable format; sorting is best-effort)
-                    fi
-
-                    [ "$did_backup" = "0" ] && backup_config_file "$cfg" >/dev/null 2>&1 && did_backup="1"
-
-                    # Cleanup old iptables rules (best-effort)
-                    if [ -n "$old_entries" ]; then
-                        while read -r op oproto; do
-                            [ -z "$op" ] && continue
-                            remove_iptables_rules "$op" "$oproto"
-                        done <<< "$old_entries"
-                    fi
-
-                    # Apply new forward section
-                    yaml_set_forward_section "$cfg" "${lines[@]}"
-
-                    # Add iptables for new rules
-                    if [ ${#protos[@]} -gt 0 ]; then
-                        for p in $(printf "%s\n" "${!protos[@]}" | sort -n); do
-                            case "${protos[$p]}" in
-                                udp) configure_iptables "$p" "udp" ;;
-                                both) configure_iptables "$p" "both" ;;
-                                *) configure_iptables "$p" "tcp" ;;
-                            esac
-                        done
-                    fi
-
-                    print_success "Forward rules updated"
-                    read -p "Restart service now? (y/N): " restart_choice
-                    if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
-                        systemctl restart "$selected_service" >/dev/null 2>&1
-                        systemctl is-active --quiet "$selected_service" && print_success "Service restarted" || print_error "Service failed to start"
-                    fi
-                    pause
-                    ;;
-                3)
-                    if ! grep -q "^socks5:" "$cfg" 2>/dev/null; then
-                        print_error "No socks5 section in this config"
-                        pause
-                        continue
-                    fi
-
-                    echo ""
-                    echo -e "${YELLOW}SOCKS5 is usually safer on 127.0.0.1 (local only).${NC}"
-                    echo -e "${YELLOW}If you set 0.0.0.0, it will be reachable from outside (be careful!).${NC}"
-                    echo ""
-                    local new_ip new_port
-                    read -p "SOCKS5 listen IP (current ${socks_ip:-127.0.0.1}) [Enter=keep]: " new_ip
-                    read -p "SOCKS5 port (current ${socks_port:-?}) [Enter=keep]: " new_port
-                    new_ip="${new_ip:-$socks_ip}"
-                    new_port="${new_port:-$socks_port}"
-
-                    if [ -z "$new_ip" ] || ! validate_host "$new_ip"; then
-                        print_error "Invalid listen IP/host"
-                        pause
-                        continue
-                    fi
-                    if ! validate_port "$new_port"; then
-                        print_error "Invalid port"
-                        pause
-                        continue
-                    fi
-                    check_port_conflict "$new_port" || { pause; continue; }
-
-                    [ "$did_backup" = "0" ] && backup_config_file "$cfg" >/dev/null 2>&1 && did_backup="1"
-
-                    # iptables update
-                    if [ -n "$socks_port" ] && validate_port "$socks_port"; then
-                        remove_iptables_rules "$socks_port" "tcp"
-                    fi
-                    configure_iptables "$new_port" "tcp"
-
-                    yaml_set_socks5_listen "$cfg" "$new_ip" "$new_port"
-
-                    print_success "SOCKS5 updated to ${new_ip}:${new_port}"
-                    read -p "Restart service now? (y/N): " restart_choice
-                    if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
-                        systemctl restart "$selected_service" >/dev/null 2>&1
-                        systemctl is-active --quiet "$selected_service" && print_success "Service restarted" || print_error "Service failed to start"
-                    fi
-                    pause
-                    ;;
-                9)
-                    local editor="nano"
-                    command -v nano &>/dev/null || editor="vi"
-                    $editor "$cfg"
-                    read -p "Restart service to apply changes? (y/N): " restart_choice
-                    if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
-                        systemctl restart "$selected_service" >/dev/null 2>&1
-                        systemctl is-active --quiet "$selected_service" && print_success "Service restarted" || print_error "Service failed to start"
-                    fi
-                    pause
-                    ;;
-                *) print_error "Invalid choice"; sleep 1 ;;
-            esac
-        else
-            print_warning "Unknown config role. Use full editor instead."
-            local editor="nano"
-            command -v nano &>/dev/null || editor="vi"
-            $editor "$cfg"
-            pause
-        fi
-    done
-}
-
 # Manage single service
 manage_single_service() {
     local selected_service="$1"
@@ -1421,11 +714,10 @@ manage_single_service() {
         echo " 7. 📄 View Configuration"
         echo " 8. ⏰ Cronjob Management"
         echo " 9. 🗑️  Delete Service"
-        echo " 10. ⚡ Quick Edit IP/Ports"
         echo " 0. ↩️  Back"
         echo ""
         
-        read -p "Choose action [0-10]: " action
+        read -p "Choose action [0-9]: " action
         
         case "$action" in
             0) return ;;
@@ -1486,9 +778,6 @@ manage_single_service() {
                    pause
                    return
                fi ;;
-            10) local cfg="$CONFIG_DIR/$display_name.yaml"
-               quick_edit_ip_ports "$cfg" "$selected_service"
-               ;;
             *) print_error "Invalid choice"
                sleep 1 ;;
         esac
@@ -2693,7 +1982,7 @@ test_internet_connectivity() {
         if [ "$speed_test" != "0" ] && [ -n "$speed_test" ]; then
             if command -v bc &>/dev/null; then
                 local speed_mbps
-                speed_mbps=$(echo "scale=2; $speed_test * 8 / 1000000" | bc 2>/dev/null || echo "0")
+                speed_mbps=$(echo "scale=2; $speed_test * 8 / 10fariid0" | bc 2>/dev/null || echo "0")
                 
                 if (( $(echo "$speed_mbps > 10" | bc -l 2>/dev/null) )); then
                     echo -e " ${GREEN}✅ Download speed: ${speed_mbps} Mbps${NC}"
@@ -2703,7 +1992,7 @@ test_internet_connectivity() {
                     echo -e " ${RED}❌ Download speed: ${speed_mbps} Mbps${NC}"
                 fi
             else
-                local speed_mbps_int=$(( (${speed_test%.*} * 8) / 1000000 ))
+                local speed_mbps_int=$(( (${speed_test%.*} * 8) / 10fariid0 ))
                 if [ "$speed_mbps_int" -gt 10 ]; then
                     echo -e " ${GREEN}✅ Download speed: ~${speed_mbps_int} Mbps${NC}"
                 elif [ "$speed_mbps_int" -gt 1 ]; then
@@ -5742,6 +5031,8 @@ BOT_CONFIG="/etc/telegram-paqet-bot/config.conf"
 LOG_FILE="/var/log/telegram-paqet-bot.log"
 LAST_STATE_FILE="/etc/telegram-paqet-bot/last_state"
 OFFSET_FILE="/etc/telegram-paqet-bot/offset"
+PENDING_FILE="/etc/telegram-paqet-bot/pending"
+PAQET_CONFIG_DIR="/etc/paqet"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
@@ -5909,6 +5200,297 @@ html_escape() {
     sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
 }
 
+# -----------------------------
+# Config edit helpers (stateful)
+# -----------------------------
+pending_get() { [ -f "$PENDING_FILE" ] && cat "$PENDING_FILE" || echo ""; }
+pending_set() { echo "$1" > "$PENDING_FILE"; }
+pending_clear() { rm -f "$PENDING_FILE" 2>/dev/null || true; }
+
+cfg_name_from_unit() {
+    local u="${1%.service}"
+    echo "${u#paqet-}"
+}
+cfg_file_from_unit() {
+    echo "${PAQET_CONFIG_DIR}/$(cfg_name_from_unit "$1").yaml"
+}
+
+is_valid_port() {
+    local p="$1"
+    [[ "$p" =~ ^[0-9]+$ ]] && [ "$p" -ge 1 ] && [ "$p" -le 65535 ]
+}
+
+is_valid_ip() {
+    local ip="$1"
+    [[ "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]] || return 1
+    local IFS='.'
+    read -r o1 o2 o3 o4 <<< "$ip"
+    for o in "$o1" "$o2" "$o3" "$o4"; do
+        [[ "$o" -ge 0 && "$o" -le 255 ]] || return 1
+    done
+    return 0
+}
+
+cfg_role() {
+    local f="$1"
+    local r
+    r=$(grep -m1 '^role:' "$f" 2>/dev/null | awk '{print $2}' | tr -d '"')
+    echo "${r:-unknown}"
+}
+
+cfg_get_listen_port() {
+    local f="$1"
+    awk '
+        /^listen:[[:space:]]*$/ {in_listen=1; next}
+        in_listen && /^[[:space:]]{2}addr:/ {
+            gsub(/.*":/,""); gsub(/".*/,""); print; exit
+        }
+        /^[^[:space:]]/ {in_listen=0}
+    ' "$f" 2>/dev/null
+}
+
+cfg_get_server_addr() {
+    local f="$1"
+    awk '
+        /^server:[[:space:]]*$/ {in_srv=1; next}
+        in_srv && /^[[:space:]]{2}addr:/ {
+            gsub(/.*"/,""); gsub(/".*/,""); print; exit
+        }
+        /^[^[:space:]]/ {in_srv=0}
+    ' "$f" 2>/dev/null
+}
+
+cfg_get_forward_summary() {
+    local f="$1"
+    awk '
+        /^forward:[[:space:]]*$/ {in_fwd=1; next}
+        in_fwd && /^[^[:space:]]/ {exit}
+        in_fwd && /listen:/ {
+            if (match($0, /:([0-9]+)"/, m)) { port=m[1] }
+        }
+        in_fwd && /protocol:/ {
+            proto=$2; gsub(/"/,"",proto)
+            if (port!="") { print port "/" proto }
+            port=""
+        }
+    ' "$f" 2>/dev/null | paste -sd, - 2>/dev/null
+}
+
+# Minimal iptables NOTRACK helper (best-effort)
+iptables_add_notrack() {
+    local port="$1"
+    local proto="$2"
+
+    command -v iptables >/dev/null 2>&1 || return 0
+    [ -z "$port" ] && return 0
+
+    local protos=()
+    [ "$proto" = "both" ] && protos=("tcp" "udp") || protos=("$proto")
+
+    for p in "${protos[@]}"; do
+        iptables -t raw -D PREROUTING -p "$p" --dport "$port" -j NOTRACK 2>/dev/null || true
+        iptables -t raw -D OUTPUT -p "$p" --sport "$port" -j NOTRACK 2>/dev/null || true
+        iptables -t raw -A PREROUTING -p "$p" --dport "$port" -j NOTRACK 2>/dev/null || true
+        iptables -t raw -A OUTPUT -p "$p" --sport "$port" -j NOTRACK 2>/dev/null || true
+
+        if [ "$p" = "tcp" ]; then
+            iptables -t mangle -D OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null || true
+            iptables -t mangle -A OUTPUT -p tcp --sport "$port" --tcp-flags RST RST -j DROP 2>/dev/null || true
+        fi
+    done
+
+    # Persistence (best effort)
+    if [ -d /etc/iptables ] && command -v iptables-save >/dev/null 2>&1; then
+        mkdir -p /etc/iptables 2>/dev/null || true
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        chmod 600 /etc/iptables/rules.v4 2>/dev/null || true
+        if command -v netfilter-persistent >/dev/null 2>&1; then
+            netfilter-persistent save >/dev/null 2>&1 || true
+        elif command -v service >/dev/null 2>&1 && systemctl is-active iptables >/dev/null 2>&1; then
+            service iptables save >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
+cfg_set_server_ip() {
+    local f="$1"
+    local newip="$2"
+    local tmp
+    tmp=$(mktemp)
+
+    awk -v newip="$newip" '
+        BEGIN{in_srv=0; done=0}
+        /^server:[[:space:]]*$/ {print; in_srv=1; next}
+        in_srv && /^[[:space:]]{2}addr:/ && done==0 {
+            line=$0
+            gsub(/.*"/,"",line); gsub(/".*/,"",line)
+            # line now like host:port
+            n=split(line, a, ":")
+            port=a[n]
+            printf "  addr: \"%s:%s\"\n", newip, port
+            done=1
+            next
+        }
+        /^[^[:space:]]/ {in_srv=0}
+        {print}
+    ' "$f" > "$tmp" && mv "$tmp" "$f"
+}
+
+cfg_set_server_port() {
+    local f="$1"
+    local newport="$2"
+    local tmp
+    tmp=$(mktemp)
+
+    awk -v newport="$newport" '
+        BEGIN{in_srv=0; done=0}
+        /^server:[[:space:]]*$/ {print; in_srv=1; next}
+        in_srv && /^[[:space:]]{2}addr:/ && done==0 {
+            line=$0
+            gsub(/.*"/,"",line); gsub(/".*/,"",line)
+            n=split(line, a, ":")
+            # host could include : if ipv6; we keep everything except last element
+            host=""
+            for (i=1;i<n;i++) { host = (host=="" ? a[i] : host ":" a[i]) }
+            if (host=="") host=a[1]
+            printf "  addr: \"%s:%s\"\n", host, newport
+            done=1
+            next
+        }
+        /^[^[:space:]]/ {in_srv=0}
+        {print}
+    ' "$f" > "$tmp" && mv "$tmp" "$f"
+}
+
+cfg_set_listen_port() {
+    local f="$1"
+    local newport="$2"
+    local tmp
+    tmp=$(mktemp)
+
+    awk -v newport="$newport" '
+        BEGIN{in_listen=0; in_net=0; in_ipv4=0}
+        /^listen:[[:space:]]*$/ {print; in_listen=1; next}
+        in_listen && /^[[:space:]]{2}addr:/ {
+            print "  addr: \":" newport "\""
+            in_listen=0
+            next
+        }
+
+        /^network:[[:space:]]*$/ {print; in_net=1; in_ipv4=0; next}
+        in_net && /^[[:space:]]{2}ipv4:[[:space:]]*$/ {print; in_ipv4=1; next}
+        in_ipv4 && /^[[:space:]]{4}addr:/ {
+            line=$0
+            gsub(/.*"/,"",line); gsub(/".*/,"",line)
+            split(line, a, ":")
+            ip=a[1]
+            printf "    addr: \"%s:%s\"\n", ip, newport
+            in_ipv4=0
+            next
+        }
+
+        /^[^[:space:]]/ {in_listen=0; in_net=0; in_ipv4=0}
+        {print}
+    ' "$f" > "$tmp" && mv "$tmp" "$f"
+}
+
+build_forward_section_file() {
+    local spec="$1"
+    local outfile="$2"
+    local spec_clean
+    spec_clean=$(echo "$spec" | tr -d '[:space:]')
+
+    [ -z "$spec_clean" ] && return 1
+
+    # Get tunnel port to prevent loops
+    local server_addr tunnel_port
+    server_addr="$(cfg_get_server_addr "$CFG_FILE_ACTIVE")"
+    tunnel_port="${server_addr##*:}"
+
+    echo "forward:" > "$outfile"
+
+    IFS=',' read -ra items <<< "$spec_clean"
+    local any=0
+    for it in "${items[@]}"; do
+        [ -z "$it" ] && continue
+        local port proto
+        port="$it"
+        proto="tcp"
+        if [[ "$it" == */* ]]; then
+            port="${it%%/*}"
+            proto="${it##*/}"
+        fi
+        proto="${proto,,}"
+        case "$proto" in
+            tcp|udp|both|tcpudp|tcp/udp) : ;;
+            *) proto="tcp" ;;
+        esac
+        [ "$proto" = "tcpudp" ] && proto="both"
+        [ "$proto" = "tcp/udp" ] && proto="both"
+
+        is_valid_port "$port" || return 2
+
+        # loop prevention: forward port must not equal tunnel port
+        if [ -n "$tunnel_port" ] && [ "$port" = "$tunnel_port" ]; then
+            return 3
+        fi
+
+        any=1
+        if [ "$proto" = "both" ]; then
+            cat >> "$outfile" <<EOFSEC
+  - listen: "0.0.0.0:${port}"
+    target: "127.0.0.1:${port}"
+    protocol: "tcp"
+  - listen: "0.0.0.0:${port}"
+    target: "127.0.0.1:${port}"
+    protocol: "udp"
+EOFSEC
+        else
+            cat >> "$outfile" <<EOFSEC
+  - listen: "0.0.0.0:${port}"
+    target: "127.0.0.1:${port}"
+    protocol: "${proto}"
+EOFSEC
+        fi
+    done
+
+    [ $any -eq 1 ] || return 1
+    return 0
+}
+
+replace_forward_section() {
+    local cfg="$1"
+    local secfile="$2"
+    local tmp
+    tmp=$(mktemp)
+
+    awk -v secfile="$secfile" '
+        function printsec() {
+            while ((getline l < secfile) > 0) print l
+            close(secfile)
+        }
+        BEGIN{in_fwd=0; inserted=0}
+        /^forward:[[:space:]]*$/ {
+            if (!inserted) { printsec(); inserted=1 }
+            in_fwd=1
+            next
+        }
+        in_fwd==1 {
+            # skip old forward block lines until next top-level key
+            if ($0 ~ /^[^[:space:]]/) { in_fwd=0 }
+            else { next }
+        }
+        (!inserted && /^network:[[:space:]]*$/) {
+            printsec(); inserted=1
+        }
+        { print }
+        END {
+            if (!inserted) { printsec() }
+        }
+    ' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+}
+
+
 svc_status_detail() {
     local unit
     unit="$(normalize_unit "$1")"
@@ -6049,6 +5631,7 @@ kb_service_panel() {
   [{"text":"🟢 Start","callback_data":"svc:${unit}:start"},{"text":"🔴 Stop","callback_data":"svc:${unit}:stop"}],
   [{"text":"🔄 Restart","callback_data":"svc:${unit}:restart"},{"text":"📊 Status","callback_data":"svc:${unit}:status"}],
   [{"text":"⏰ Cronjob","callback_data":"cron:${unit}:menu"}],
+  [{"text":"✏️ ویرایش کانفیگ","callback_data":"cfg:${unit}:menu"}],
   [{"text":"⬅️ لیست سرویس‌ها","callback_data":"menu:services"},{"text":"🏠 منوی اصلی","callback_data":"menu:home"}]
 ]}
 JSON
@@ -6066,6 +5649,82 @@ kb_cron_panel() {
 ]}
 JSON
 }
+
+kb_cfg_menu() {
+    local unit="$1"
+    local cfg_file
+    cfg_file="$(cfg_file_from_unit "$unit")"
+    local role
+    role="$(cfg_role "$cfg_file")"
+
+    if [ "$role" = "client" ]; then
+        cat << JSON
+{"inline_keyboard":[
+  [{"text":"🌍 تغییر IP سرور","callback_data":"cfg:${unit}:set:server_ip"},{"text":"🔌 تغییر پورت سرور","callback_data":"cfg:${unit}:set:server_port"}],
+  [{"text":"🔀 ویرایش پورت‌های فوروارد","callback_data":"cfg:${unit}:set:forward_ports"}],
+  [{"text":"⬅️ بازگشت","callback_data":"svc:${unit}:menu"},{"text":"🏠 منوی اصلی","callback_data":"menu:home"}]
+]}
+JSON
+    elif [ "$role" = "server" ]; then
+        cat << JSON
+{"inline_keyboard":[
+  [{"text":"🔌 تغییر پورت Listen","callback_data":"cfg:${unit}:set:listen_port"}],
+  [{"text":"⬅️ بازگشت","callback_data":"svc:${unit}:menu"},{"text":"🏠 منوی اصلی","callback_data":"menu:home"}]
+]}
+JSON
+    else
+        cat << JSON
+{"inline_keyboard":[
+  [{"text":"⬅️ بازگشت","callback_data":"svc:${unit}:menu"},{"text":"🏠 منوی اصلی","callback_data":"menu:home"}]
+]}
+JSON
+    fi
+}
+
+page_cfg_menu() {
+    local unit="$1"
+    local cfg_file
+    cfg_file="$(cfg_file_from_unit "$unit")"
+    local role
+    role="$(cfg_role "$cfg_file")"
+
+    local msg="✏️ <b>ویرایش کانفیگ</b>\n\n"
+    msg+="🧰 سرویس: <code>${unit%.service}</code>\n"
+    msg+="📄 فایل: <code>${cfg_file}</code>\n"
+    msg+="🏷 نقش: <code>${role}</code>\n\n"
+
+    if [ ! -f "$cfg_file" ]; then
+        msg+="❌ فایل کانفیگ پیدا نشد.\n"
+        echo -e "$msg"
+        return
+    fi
+
+    if [ "$role" = "client" ]; then
+        local srv
+        srv="$(cfg_get_server_addr "$cfg_file")"
+        local fwd
+        fwd="$(cfg_get_forward_summary "$cfg_file")"
+        msg+="🌐 Server: <code>${srv:-نامشخص}</code>\n"
+        msg+="🔀 Forward: <code>${fwd:-ندارد}</code>\n\n"
+        msg+="راهنما:\n"
+        msg+="• برای تغییر IP/پورت سرور، دکمه‌ها رو بزن.\n"
+        msg+="• برای فوروارد، فرمت: <code>443/tcp,53/udp,8443/both</code>\n"
+        msg+="  (اگر /tcp یا /udp نذاری، پیش‌فرض tcp هست)\n"
+        msg+="• برای لغو عملیات در حالت ورود، <code>لغو</code> یا <code>/cancel</code> بفرست.\n"
+    elif [ "$role" = "server" ]; then
+        local lp
+        lp="$(cfg_get_listen_port "$cfg_file")"
+        msg+="🔌 Listen Port: <code>${lp:-نامشخص}</code>\n\n"
+        msg+="راهنما:\n"
+        msg+="• تغییر پورت Listen باعث ری‌استارت سرویس میشه.\n"
+        msg+="• برای لغو عملیات در حالت ورود، <code>لغو</code> یا <code>/cancel</code> بفرست.\n"
+    else
+        msg+="ℹ️ نقش نامشخصه؛ فقط می‌تونی برگردی.\n"
+    fi
+
+    echo -e "$msg"
+}
+
 
 # -----------------------------
 # Render pages
@@ -6188,6 +5847,124 @@ handle_message_text() {
 
     [ "$chat_id" != "$CHAT_ID" ] && return 0
 
+    # If we are in an edit flow, treat normal messages as input
+    local pending
+    pending="$(pending_get)"
+    if [ -n "$pending" ]; then
+        local trimmed
+        trimmed="$(echo "$text" | tr -d '\r')"
+
+        if [[ "${trimmed,,}" =~ ^(/cancel|cancel|لغو)$ ]]; then
+            pending_clear
+            send_message "$chat_id" "✅ <b>لغو شد</b>\n\nبرای ادامه /menu رو بفرست." "$(kb_main)"
+            return 0
+        fi
+
+        IFS='|' read -r _p unit field <<< "$pending"
+        unit="$(normalize_unit "$unit")"
+        local cfg_file
+        cfg_file="$(cfg_file_from_unit "$unit")"
+
+        if [ ! -f "$cfg_file" ]; then
+            pending_clear
+            send_message "$chat_id" "❌ فایل کانفیگ پیدا نشد: <code>${cfg_file}</code>" "$(kb_main)"
+            return 0
+        fi
+
+        # Make cfg file path available to forward builder
+        CFG_FILE_ACTIVE="$cfg_file"
+
+        case "$field" in
+            server_ip)
+                local newip
+                newip="$(echo "$trimmed" | tr -d '[:space:]')"
+                if ! is_valid_ip "$newip"; then
+                    send_message "$chat_id" "❌ IP نامعتبره. مثال درست: <code>45.76.123.89</code>\nبرای لغو: <code>لغو</code>" ""
+                    return 0
+                fi
+                cfg_set_server_ip "$cfg_file" "$newip"
+                systemctl restart "$unit" >/dev/null 2>&1 || true
+                pending_clear
+                send_message "$chat_id" "✅ IP سرور آپدیت شد.\n\n$(page_cfg_menu "$unit")" "$(kb_cfg_menu "$unit")"
+                return 0
+                ;;
+            server_port)
+                local newport
+                newport="$(echo "$trimmed" | tr -d '[:space:]')"
+                if ! is_valid_port "$newport"; then
+                    send_message "$chat_id" "❌ پورت نامعتبره. بازه: <code>1-65535</code>\nبرای لغو: <code>لغو</code>" ""
+                    return 0
+                fi
+                cfg_set_server_port "$cfg_file" "$newport"
+                systemctl restart "$unit" >/dev/null 2>&1 || true
+                pending_clear
+                send_message "$chat_id" "✅ پورت سرور آپدیت شد.\n\n$(page_cfg_menu "$unit")" "$(kb_cfg_menu "$unit")"
+                return 0
+                ;;
+            listen_port)
+                local newport
+                newport="$(echo "$trimmed" | tr -d '[:space:]')"
+                if ! is_valid_port "$newport"; then
+                    send_message "$chat_id" "❌ پورت نامعتبره. بازه: <code>1-65535</code>\nبرای لغو: <code>لغو</code>" ""
+                    return 0
+                fi
+                cfg_set_listen_port "$cfg_file" "$newport"
+                # best-effort iptables for server listen port (tcp)
+                iptables_add_notrack "$newport" "tcp"
+                systemctl restart "$unit" >/dev/null 2>&1 || true
+                pending_clear
+                send_message "$chat_id" "✅ پورت Listen آپدیت شد.\n\n$(page_cfg_menu "$unit")" "$(kb_cfg_menu "$unit")"
+                return 0
+                ;;
+            forward_ports)
+                local spec
+                spec="$trimmed"
+                local sec tmpsec
+                tmpsec="$(mktemp)"
+                if ! build_forward_section_file "$spec" "$tmpsec"; then
+                    local rc=$?
+                    rm -f "$tmpsec" 2>/dev/null || true
+                    if [ "$rc" = "2" ]; then
+                        send_message "$chat_id" "❌ پورت/فرمت نامعتبره. مثال: <code>443/tcp,53/udp,8443/both</code>\nبرای لغو: <code>لغو</code>" ""
+                    elif [ "$rc" = "3" ]; then
+                        send_message "$chat_id" "❌ خطر Loop! یکی از پورت‌های فوروارد با پورت تونل یکیه.\nلطفاً پورت‌ها رو عوض کن.\nبرای لغو: <code>لغو</code>" ""
+                    else
+                        send_message "$chat_id" "❌ لیست پورت‌ها خالی/نامعتبره.\nمثال: <code>443,8443/both</code>\nبرای لغو: <code>لغو</code>" ""
+                    fi
+                    return 0
+                fi
+
+                replace_forward_section "$cfg_file" "$tmpsec"
+                rm -f "$tmpsec" 2>/dev/null || true
+
+                # Apply iptables for all current forward entries (best-effort)
+                local fwd_now
+                fwd_now="$(cfg_get_forward_summary "$cfg_file")"
+                IFS=',' read -ra parts <<< "$(echo "$fwd_now" | tr -d '[:space:]')"
+                for p in "${parts[@]}"; do
+                    local port="${p%%/*}"
+                    local proto="${p##*/}"
+                    [ -z "$port" ] && continue
+                    case "$proto" in
+                        tcp) iptables_add_notrack "$port" "tcp" ;;
+                        udp) iptables_add_notrack "$port" "udp" ;;
+                        *) : ;;
+                    esac
+                done
+
+                systemctl restart "$unit" >/dev/null 2>&1 || true
+                pending_clear
+                send_message "$chat_id" "✅ پورت‌های فوروارد آپدیت شد.\n\n$(page_cfg_menu "$unit")" "$(kb_cfg_menu "$unit")"
+                return 0
+                ;;
+            *)
+                pending_clear
+                send_message "$chat_id" "⚠️ حالت ویرایش نامعتبر بود و ریست شد.\n/menu" "$(kb_main)"
+                return 0
+                ;;
+        esac
+    fi
+
     case "$text" in
         "/start"|"/menu"|"menu"|"پنل"|"panel") send_message "$chat_id" "$(page_home)" "$(kb_main)" ;;
         "/status"|"status") send_message "$chat_id" "$(format_all_status)" "$(kb_back_home)" ;;
@@ -6222,6 +5999,36 @@ handle_callback() {
         more:disable_all)
             while read -r u; do [ -n "$u" ] && systemctl disable "$u" >/dev/null 2>&1 || true; done < <(list_paqet_services)
             edit_message "$chat_id" "$message_id" "✅ <b>Disable</b> برای همه سرویس‌های Paqet انجام شد." "$(kb_more)"
+            ;;
+
+        cfg:*.service:menu)
+            local unit="${data#cfg:}"
+            unit="${unit%:menu}"
+            edit_message "$chat_id" "$message_id" "$(page_cfg_menu "$unit")" "$(kb_cfg_menu "$unit")"
+            ;;
+        cfg:*.service:set:server_ip)
+            local rest="${data#cfg:}"
+            local unit="${rest%%:*}"
+            pending_set "edit|${unit}|server_ip"
+            edit_message "$chat_id" "$message_id" "🌍 <b>تغییر IP سرور</b>\n\nIP جدید رو ارسال کن.\nمثال: <code>45.76.123.89</code>\n\nلغو: <code>لغو</code> یا <code>/cancel</code>" "$(kb_cfg_menu "$unit")"
+            ;;
+        cfg:*.service:set:server_port)
+            local rest="${data#cfg:}"
+            local unit="${rest%%:*}"
+            pending_set "edit|${unit}|server_port"
+            edit_message "$chat_id" "$message_id" "🔌 <b>تغییر پورت سرور</b>\n\nپورت جدید رو ارسال کن.\nمثال: <code>8888</code>\n\nلغو: <code>لغو</code> یا <code>/cancel</code>" "$(kb_cfg_menu "$unit")"
+            ;;
+        cfg:*.service:set:listen_port)
+            local rest="${data#cfg:}"
+            local unit="${rest%%:*}"
+            pending_set "edit|${unit}|listen_port"
+            edit_message "$chat_id" "$message_id" "🔌 <b>تغییر پورت Listen</b>\n\nپورت جدید رو ارسال کن.\nمثال: <code>8888</code>\n\nلغو: <code>لغو</code> یا <code>/cancel</code>" "$(kb_cfg_menu "$unit")"
+            ;;
+        cfg:*.service:set:forward_ports)
+            local rest="${data#cfg:}"
+            local unit="${rest%%:*}"
+            pending_set "edit|${unit}|forward_ports"
+            edit_message "$chat_id" "$message_id" "🔀 <b>ویرایش پورت‌های فوروارد</b>\n\nلیست پورت‌ها رو با کاما ارسال کن.\nفرمت: <code>443/tcp,53/udp,8443/both</code>\n(اگر /tcp یا /udp نذاری، پیش‌فرض tcp هست)\n\nلغو: <code>لغو</code> یا <code>/cancel</code>" "$(kb_cfg_menu "$unit")"
             ;;
         svc:*.service:menu)
             local unit="${data#svc:}"
