@@ -854,6 +854,392 @@ manage_cronjob() {
     done
 }
 
+
+
+# ================================================
+# WATCHER MANAGEMENT (Log-based restart on pattern)
+# - Creates/Removes systemd drop-in override per tunnel
+# - Stores per-tunnel settings in: $CONFIG_DIR/watcher/<tunnel>.conf
+# ================================================
+
+# Prefer existing watcher script if user already created it
+if [ -f "/root/paqet/paqet_watcher.py" ]; then
+    WATCHER_SCRIPT="/root/paqet/paqet_watcher.py"
+else
+    WATCHER_SCRIPT="$INSTALL_DIR/paqet_watcher.py"
+fi
+WATCHER_CFG_DIR="$CONFIG_DIR/watcher"
+WATCHER_DEFAULT_GRACE=5
+WATCHER_DEFAULT_PATTERN="%!s"
+WATCHER_DEFAULT_RESTART_DELAY=2
+
+_watcher_python_bin() {
+    command -v python3 2>/dev/null || echo "/usr/bin/python3"
+}
+
+_watcher_pause() {
+    if command -v pause >/dev/null 2>&1; then
+        pause
+    else
+        echo ""
+        read -p "Press Enter to continue..."
+    fi
+}
+
+_watcher_escape_squotes() {
+    # Escape single quotes for bash single-quoted strings
+    printf "%s" "$1" | sed "s/'/'\"'\"'/g"
+}
+
+_watcher_escape_systemd_percent() {
+    # In systemd unit files, '%' is special. Use '%%' for literal '%'.
+    printf "%s" "$1" | sed 's/%/%%/g'
+}
+
+_watcher_cfg_file() {
+    local tunnel="$1"
+    echo "$WATCHER_CFG_DIR/${tunnel}.conf"
+}
+
+_watcher_ensure_script() {
+    # If the watcher python file is missing, generate it automatically.
+    if [ -f "$WATCHER_SCRIPT" ]; then
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$WATCHER_SCRIPT")" 2>/dev/null || true
+
+    cat > "$WATCHER_SCRIPT" << 'PYWATCH'
+#!/usr/bin/env python3
+import argparse
+import os
+import signal
+import subprocess
+import sys
+import time
+
+
+def terminate_process_group(proc: subprocess.Popen, timeout: int = 5) -> None:
+    """Terminate whole process group (paqet + children) safely."""
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=timeout)
+    except Exception:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            pass
+
+
+def run_watch_loop(binary: str, config: str, pattern: str, grace: int, restart_delay: int) -> None:
+    cmd = [binary, "run", "-c", config]
+
+    while True:
+        print(f"[Watcher] Starting: {' '.join(cmd)}", flush=True)
+        print(f"[Watcher] Ignoring '{pattern}' for first {grace}s", flush=True)
+
+        if not os.path.exists(binary):
+            print(f"[Watcher] ERROR: binary not found: {binary}", flush=True)
+            time.sleep(5)
+            continue
+
+        if not os.path.exists(config):
+            print(f"[Watcher] ERROR: config not found: {config}", flush=True)
+            time.sleep(5)
+            continue
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+
+        start_time = time.time()
+
+        try:
+            assert proc.stdout is not None
+            for line in iter(proc.stdout.readline, ""):
+                sys.stdout.write(line)
+                sys.stdout.flush()
+
+                elapsed = time.time() - start_time
+                if elapsed >= grace and pattern in line:
+                    print(f"\n[Watcher] Detected pattern after grace ({elapsed:.1f}s). Restarting...", flush=True)
+                    terminate_process_group(proc)
+                    break
+
+            if proc.poll() is not None:
+                print(f"[Watcher] Process exited (code={proc.returncode}). Restarting...", flush=True)
+
+        except Exception as e:
+            print(f"[Watcher] ERROR while watching logs: {e}", flush=True)
+            terminate_process_group(proc)
+
+        time.sleep(restart_delay)
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Watch paqet logs and restart on pattern after grace period.")
+    ap.add_argument("--binary", default="/usr/local/bin/paqet", help="Path to paqet binary")
+    ap.add_argument("--config", required=True, help="Path to config yaml (e.g. /etc/paqet/server.yaml)")
+    ap.add_argument("--pattern", default="%!s", help="Error string/pattern to trigger restart")
+    ap.add_argument("--grace", type=int, default=5, help="Grace period seconds")
+    ap.add_argument("--restart-delay", type=int, default=2, help="Seconds to wait before restarting")
+    args = ap.parse_args()
+
+    run_watch_loop(args.binary, args.config, args.pattern, args.grace, args.restart_delay)
+
+
+if __name__ == "__main__":
+    main()
+PYWATCH
+
+    chmod +x "$WATCHER_SCRIPT" 2>/dev/null || true
+}
+
+_watcher_load_settings() {
+    local tunnel="$1"
+
+    # defaults
+    WATCHER_GRACE="$WATCHER_DEFAULT_GRACE"
+    WATCHER_PATTERN="$WATCHER_DEFAULT_PATTERN"
+    WATCHER_RESTART_DELAY="$WATCHER_DEFAULT_RESTART_DELAY"
+
+    mkdir -p "$WATCHER_CFG_DIR" 2>/dev/null || true
+    local f
+    f=$(_watcher_cfg_file "$tunnel")
+
+    if [ -f "$f" ]; then
+        # shellcheck disable=SC1090
+        source "$f" 2>/dev/null || true
+        [ -n "$WATCHER_GRACE" ] || WATCHER_GRACE="$WATCHER_DEFAULT_GRACE"
+        [ -n "$WATCHER_PATTERN" ] || WATCHER_PATTERN="$WATCHER_DEFAULT_PATTERN"
+        [ -n "$WATCHER_RESTART_DELAY" ] || WATCHER_RESTART_DELAY="$WATCHER_DEFAULT_RESTART_DELAY"
+    fi
+}
+
+_watcher_save_settings() {
+    local tunnel="$1"
+    local grace="$2"
+    local delay="$3"
+    local pattern="$4"
+
+    mkdir -p "$WATCHER_CFG_DIR" 2>/dev/null || true
+    local f
+    f=$(_watcher_cfg_file "$tunnel")
+
+    local pat_esc
+    pat_esc=$(_watcher_escape_squotes "$pattern")
+
+    cat > "$f" << EOF
+WATCHER_GRACE=${grace}
+WATCHER_RESTART_DELAY=${delay}
+WATCHER_PATTERN='${pat_esc}'
+EOF
+}
+
+_watcher_override_dir() {
+    local unit="$1"  # example: paqet-ara124.service
+    echo "/etc/systemd/system/${unit}.d"
+}
+
+_watcher_override_file() {
+    local unit="$1"
+    echo "$(_watcher_override_dir "$unit")/override.conf"
+}
+
+_watcher_is_enabled() {
+    local unit="$1"
+    local f
+    f=$(_watcher_override_file "$unit")
+
+    [ -f "$f" ] && grep -q "$WATCHER_SCRIPT" "$f" 2>/dev/null
+}
+
+_watcher_apply_override() {
+    local unit="$1"      # paqet-xxx.service
+    local tunnel="$2"    # xxx
+    local cfg_file="$CONFIG_DIR/${tunnel}.yaml"
+
+    if [ ! -f "$cfg_file" ]; then
+        print_error "Config file not found: $cfg_file"
+        return 1
+    fi
+
+    _watcher_ensure_script
+
+    _watcher_load_settings "$tunnel"
+
+    # Validate numbers
+    if ! [[ "$WATCHER_GRACE" =~ ^[0-9]+$ ]]; then WATCHER_GRACE="$WATCHER_DEFAULT_GRACE"; fi
+    if ! [[ "$WATCHER_RESTART_DELAY" =~ ^[0-9]+$ ]]; then WATCHER_RESTART_DELAY="$WATCHER_DEFAULT_RESTART_DELAY"; fi
+
+    local py
+    py=$(_watcher_python_bin)
+
+    local pattern_systemd
+    pattern_systemd=$(_watcher_escape_systemd_percent "$WATCHER_PATTERN")
+
+    local odir
+    odir=$(_watcher_override_dir "$unit")
+    mkdir -p "$odir" 2>/dev/null || true
+
+    cat > "$odir/override.conf" << EOF
+[Service]
+Environment=PYTHONUNBUFFERED=1
+ExecStart=
+ExecStart=${py} ${WATCHER_SCRIPT} --binary ${BIN_DIR}/paqet --config ${cfg_file} --pattern ${pattern_systemd} --grace ${WATCHER_GRACE} --restart-delay ${WATCHER_RESTART_DELAY}
+EOF
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl restart "$unit" >/dev/null 2>&1 || true
+
+    if _watcher_is_enabled "$unit"; then
+        print_success "Watcher enabled for ${tunnel} (grace=${WATCHER_GRACE}s, delay=${WATCHER_RESTART_DELAY}s, pattern=${WATCHER_PATTERN})"
+        return 0
+    fi
+
+    print_warning "Watcher override written, but could not verify enable state. Check: $odir/override.conf"
+    return 0
+}
+
+_watcher_disable_override() {
+    local unit="$1"
+
+    local of
+    of=$(_watcher_override_file "$unit")
+
+    if [ -f "$of" ]; then
+        rm -f "$of" 2>/dev/null || true
+    fi
+
+    local od
+    od=$(_watcher_override_dir "$unit")
+    rmdir "$od" 2>/dev/null || true
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl restart "$unit" >/dev/null 2>&1 || true
+
+    print_success "Watcher disabled for ${unit}"
+}
+
+manage_watcher() {
+    local selected_service="$1"   # paqet-xxx.service
+    local tunnel="$2"             # xxx
+
+    while true; do
+        show_banner
+        echo -e "${YELLOW}Watcher (Auto Restart on Log Pattern)${NC}"
+        echo -e "Service: ${CYAN}${selected_service}${NC}"
+        echo -e "Tunnel:  ${CYAN}${tunnel}${NC}"
+        echo ""
+
+        _watcher_load_settings "$tunnel"
+
+        local enabled="OFF"
+        if _watcher_is_enabled "$selected_service"; then
+            enabled="ON"
+        fi
+
+        echo -e "Status: ${CYAN}${enabled}${NC}"
+        echo -e "Config:  grace=${CYAN}${WATCHER_GRACE}s${NC}  delay=${CYAN}${WATCHER_RESTART_DELAY}s${NC}  pattern=${CYAN}${WATCHER_PATTERN}${NC}"
+        echo ""
+
+        echo -e "${CYAN}Actions:${NC}"
+        echo -e "  1. Enable watcher for this tunnel"
+        echo -e "  2. Disable watcher for this tunnel"
+        echo -e "  3. Change grace period"
+        echo -e "  4. Change restart delay"
+        echo -e "  5. Change pattern"
+        echo -e "  6. Show override file"
+        echo -e "  0. Back"
+        echo ""
+
+        read -p "Choose option [0-6]: " wchoice
+
+        case "$wchoice" in
+            0) return ;;
+            1)
+                _watcher_apply_override "$selected_service" "$tunnel"
+                _watcher_pause
+                ;;
+            2)
+                _watcher_disable_override "$selected_service"
+                _watcher_pause
+                ;;
+            3)
+                echo ""
+                read -p "Grace seconds (current: ${WATCHER_GRACE}): " g
+                g="${g:-$WATCHER_GRACE}"
+                if ! [[ "$g" =~ ^[0-9]+$ ]]; then
+                    print_error "Invalid number"
+                    _watcher_pause
+                    continue
+                fi
+                _watcher_save_settings "$tunnel" "$g" "$WATCHER_RESTART_DELAY" "$WATCHER_PATTERN"
+                print_success "Saved grace=${g} for ${tunnel}"
+                # If enabled, re-apply to take effect
+                if _watcher_is_enabled "$selected_service"; then
+                    _watcher_apply_override "$selected_service" "$tunnel"
+                fi
+                _watcher_pause
+                ;;
+            4)
+                echo ""
+                read -p "Restart delay seconds (current: ${WATCHER_RESTART_DELAY}): " d
+                d="${d:-$WATCHER_RESTART_DELAY}"
+                if ! [[ "$d" =~ ^[0-9]+$ ]]; then
+                    print_error "Invalid number"
+                    _watcher_pause
+                    continue
+                fi
+                _watcher_save_settings "$tunnel" "$WATCHER_GRACE" "$d" "$WATCHER_PATTERN"
+                print_success "Saved restart-delay=${d} for ${tunnel}"
+                if _watcher_is_enabled "$selected_service"; then
+                    _watcher_apply_override "$selected_service" "$tunnel"
+                fi
+                _watcher_pause
+                ;;
+            5)
+                echo ""
+                read -p "Pattern (current: ${WATCHER_PATTERN}): " p
+                p="${p:-$WATCHER_PATTERN}"
+                if [ -z "$p" ]; then
+                    print_error "Pattern cannot be empty"
+                    _watcher_pause
+                    continue
+                fi
+                _watcher_save_settings "$tunnel" "$WATCHER_GRACE" "$WATCHER_RESTART_DELAY" "$p"
+                print_success "Saved pattern=${p} for ${tunnel}"
+                if _watcher_is_enabled "$selected_service"; then
+                    _watcher_apply_override "$selected_service" "$tunnel"
+                fi
+                _watcher_pause
+                ;;
+            6)
+                echo ""
+                local of
+                of=$(_watcher_override_file "$selected_service")
+                if [ -f "$of" ]; then
+                    echo -e "${CYAN}${of}${NC}"
+                    echo ""
+                    cat "$of"
+                else
+                    print_info "Override not found (watcher likely OFF)."
+                fi
+                _watcher_pause
+                ;;
+            *)
+                print_error "Invalid choice"
+                _watcher_pause
+                ;;
+        esac
+    done
+}
+
 # Configure as Server (Abroad)
 configure_server() {
     while true; do
@@ -1363,11 +1749,12 @@ manage_service() {
             echo -e "  5. Logs"
             echo -e "  6. View Config"
             echo -e "  7. Cronjob Management"
-            echo -e "  8. Delete"
-            echo -e "  9. Back"
+            echo -e "  8. Watcher (Auto Restart on %!s)"
+            echo -e "  9. Delete"
+            echo -e "  10. Back"
             echo ""
             
-            read -p "Choose action [1-9]: " action
+            read -p "Choose action [1-10]: " action
             
             case "$action" in
                 1)
@@ -1408,6 +1795,9 @@ manage_service() {
                     manage_cronjob "$service_name" "$display_name"
                     ;;
                 8)
+                    manage_watcher "$selected_service" "$display_name"
+                    ;;
+                9)
                     read -p "Delete this service? (y/N): " confirm
                     if [[ "$confirm" =~ ^[Yy]$ ]]; then
                         # Remove cronjob first
@@ -1423,7 +1813,7 @@ manage_service() {
                         return
                     fi
                     ;;
-                9)
+                10)
                     break
                     ;;
                 *)
