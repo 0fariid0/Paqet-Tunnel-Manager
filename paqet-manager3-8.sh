@@ -57,236 +57,6 @@ print_error() { echo -e "${RED}[✗]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[!]${NC} $1"; }
 print_info() { echo -e "${CYAN}[i]${NC} $1"; }
 
-
-# =================================================
-# Watcher + Live Logs (per tunnel)
-# =================================================
-WATCHER_CONF_DIR="$CONFIG_DIR/watcher"
-WATCHER_SCRIPT_PRIMARY="/root/paqet/paqet_watcher.py"
-WATCHER_SCRIPT_FALLBACK="$INSTALL_DIR/paqet_watcher.py"
-
-get_python_bin() {
-    command -v python3 2>/dev/null || echo "/usr/bin/python3"
-}
-
-get_watcher_script() {
-    if [ -f "$WATCHER_SCRIPT_PRIMARY" ]; then
-        echo "$WATCHER_SCRIPT_PRIMARY"
-        return 0
-    fi
-    if [ -f "$WATCHER_SCRIPT_FALLBACK" ]; then
-        echo "$WATCHER_SCRIPT_FALLBACK"
-        return 0
-    fi
-    return 1
-}
-
-watcher_conf_path() {
-    local tunnel="$1"
-    echo "$WATCHER_CONF_DIR/${tunnel}.conf"
-}
-
-watcher_load_conf() {
-    # Outputs: grace|delay|pattern
-    local tunnel="$1"
-    local grace="5"
-    local delay="2"
-    local pattern="%!s"
-    local conf
-    conf="$(watcher_conf_path "$tunnel")"
-    if [ -f "$conf" ]; then
-        # shellcheck disable=SC1090
-        . "$conf"
-        grace="${GRACE:-$grace}"
-        delay="${DELAY:-$delay}"
-        pattern="${PATTERN:-$pattern}"
-    fi
-    echo "${grace}|${delay}|${pattern}"
-}
-
-watcher_save_conf() {
-    local tunnel="$1"
-    local grace="$2"
-    local delay="$3"
-    local pattern="$4"
-    mkdir -p "$WATCHER_CONF_DIR" 2>/dev/null || true
-    local conf
-    conf="$(watcher_conf_path "$tunnel")"
-    {
-        echo "GRACE=${grace}"
-        echo "DELAY=${delay}"
-        printf 'PATTERN=%q\n' "$pattern"
-    } > "$conf"
-}
-
-watcher_override_path() {
-    local service_unit="$1"   # e.g. paqet-ara124.service
-    echo "/etc/systemd/system/${service_unit}.d/override.conf"
-}
-
-watcher_is_enabled() {
-    local service_unit="$1"
-    local ov
-    ov="$(watcher_override_path "$service_unit")"
-    [ -f "$ov" ] && grep -q "paqet_watcher\.py" "$ov" 2>/dev/null
-}
-
-watcher_apply_override() {
-    local service_unit="$1"
-    local tunnel="$2"
-    local grace="$3"
-    local delay="$4"
-    local pattern="$5"
-
-    local watcher
-    watcher="$(get_watcher_script)" || {
-        print_error "Watcher script not found. Create it at $WATCHER_SCRIPT_PRIMARY or $WATCHER_SCRIPT_FALLBACK"
-        return 1
-    }
-
-    local pybin
-    pybin="$(get_python_bin)"
-
-    local cfg="$CONFIG_DIR/${tunnel}.yaml"
-    if [ ! -f "$cfg" ]; then
-        print_error "Config not found: $cfg"
-        return 1
-    fi
-
-    # systemd treats % as specifier => escape to %%
-    local safe_pattern="$pattern"
-    safe_pattern="${safe_pattern//\\/\\\\}"
-    safe_pattern="${safe_pattern//\"/\\\"}"
-    safe_pattern="${safe_pattern//%/%%}"
-
-    local dir="/etc/systemd/system/${service_unit}.d"
-    mkdir -p "$dir"
-
-    cat > "${dir}/override.conf" << EOF
-[Service]
-Environment=PYTHONUNBUFFERED=1
-ExecStart=
-ExecStart=${pybin} ${watcher} --binary ${BIN_DIR}/paqet --config ${cfg} --pattern "${safe_pattern}" --grace ${grace} --restart-delay ${delay}
-EOF
-
-    systemctl daemon-reload
-    systemctl restart "$service_unit" 2>/dev/null || true
-    print_success "Watcher enabled for $tunnel"
-}
-
-watcher_disable() {
-    local service_unit="$1"
-    local tunnel="$2"
-    local dir="/etc/systemd/system/${service_unit}.d"
-    rm -f "${dir}/override.conf" 2>/dev/null || true
-    rmdir "$dir" 2>/dev/null || true
-    systemctl daemon-reload
-    systemctl restart "$service_unit" 2>/dev/null || true
-    print_success "Watcher disabled for $tunnel"
-}
-
-service_logs_menu() {
-    local service_unit="$1"
-    while true; do
-        echo ""
-        echo -e "${CYAN}Logs for ${service_unit}${NC}"
-        echo -e "  1. Recent logs (last 50 lines)"
-        echo -e "  2. Live logs (follow, Ctrl+C to stop)"
-        echo -e "  0. Back"
-        echo ""
-        read -p "Choose [0-2]: " lg
-        case "$lg" in
-            1)
-                echo ""
-                journalctl -u "$service_unit" -n 50 --no-pager
-                ;;
-            2)
-                echo ""
-                echo -e "${YELLOW}Press Ctrl+C to return...${NC}"
-                journalctl -u "$service_unit" -f -n 50 --output=short-iso
-                ;;
-            0) break ;;
-            *) print_error "Invalid choice" ;;
-        esac
-    done
-}
-
-watcher_menu() {
-    local service_unit="$1"   # paqet-xxx.service
-    local tunnel="$2"         # xxx
-
-    while true; do
-        show_banner
-        echo -e "${YELLOW}Watcher Settings: ${tunnel}${NC}\n"
-
-        local enabled="OFF"
-        watcher_is_enabled "$service_unit" && enabled="ON"
-
-        local conf
-        conf="$(watcher_load_conf "$tunnel")"
-        local grace="${conf%%|*}"; conf="${conf#*|}"
-        local delay="${conf%%|*}"; conf="${conf#*|}"
-        local pattern="$conf"
-
-        echo -e "${CYAN}Status:${NC} ${WHITE}${enabled}${NC}"
-        echo -e "${CYAN}Config:${NC} grace=${WHITE}${grace}s${NC}  delay=${WHITE}${delay}s${NC}  pattern=${WHITE}${pattern}${NC}\n"
-
-        echo -e "${CYAN}Actions:${NC}"
-        echo -e "  1. Enable watcher"
-        echo -e "  2. Disable watcher"
-        echo -e "  3. Set grace seconds"
-        echo -e "  4. Set restart delay seconds"
-        echo -e "  5. Set pattern"
-        echo -e "  6. View live logs (Ctrl+C)"
-        echo -e "  0. Back"
-        echo ""
-        read -p "Choose [0-6]: " w
-
-        case "$w" in
-            1)
-                watcher_apply_override "$service_unit" "$tunnel" "$grace" "$delay" "$pattern"
-                sleep 1
-                ;;
-            2)
-                watcher_disable "$service_unit" "$tunnel"
-                sleep 1
-                ;;
-            3)
-                read -p "Grace seconds (e.g. 5): " ng
-                ng="${ng:-$grace}"
-                if [[ "$ng" =~ ^[0-9]+$ ]] && [ "$ng" -ge 0 ] && [ "$ng" -le 300 ]; then
-                    grace="$ng"
-                    watcher_save_conf "$tunnel" "$grace" "$delay" "$pattern"
-                    watcher_is_enabled "$service_unit" && watcher_apply_override "$service_unit" "$tunnel" "$grace" "$delay" "$pattern"
-                else
-                    print_error "Invalid grace (0-300)"
-                    sleep 1
-                fi
-                ;;
-            4)
-                read -p "Restart delay seconds (e.g. 2): " nd
-                nd="${nd:-$delay}"
-                if [[ "$nd" =~ ^[0-9]+$ ]] && [ "$nd" -ge 0 ] && [ "$nd" -le 300 ]; then
-                    delay="$nd"
-                    watcher_save_conf "$tunnel" "$grace" "$delay" "$pattern"
-                    watcher_is_enabled "$service_unit" && watcher_apply_override "$service_unit" "$tunnel" "$grace" "$delay" "$pattern"
-                else
-                    print_error "Invalid delay (0-300)"
-                    sleep 1
-                fi
-                ;;
-                5)
-                    service_logs_menu "$selected_service"
-                    ;;
-                6)
-                echo -e "${YELLOW}Press Ctrl+C to return...${NC}"
-                journalctl -u "$service_unit" -f -n 50 --output=short-iso
-                ;;
-            0) break ;;
-            *) print_error "Invalid choice" ;;
-        esac
-    done
-}
 # Check root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -1590,15 +1360,14 @@ manage_service() {
             echo -e "  2. Stop"
             echo -e "  3. Restart"
             echo -e "  4. Status"
-            echo -e "  5. Logs (Recent/Live)"
+            echo -e "  5. Logs"
             echo -e "  6. View Config"
             echo -e "  7. Cronjob Management"
-            echo -e "  8. Watcher (Auto-Restart on Pattern)"
-            echo -e "  9. Delete"
-            echo -e "  0. Back"
+            echo -e "  8. Delete"
+            echo -e "  9. Back"
             echo ""
             
-            read -p "Choose action [0-9]: " action
+            read -p "Choose action [1-9]: " action
             
             case "$action" in
                 1)
@@ -1639,9 +1408,6 @@ manage_service() {
                     manage_cronjob "$service_name" "$display_name"
                     ;;
                 8)
-                    watcher_menu "$selected_service" "$display_name"
-                    ;;
-                9)
                     read -p "Delete this service? (y/N): " confirm
                     if [[ "$confirm" =~ ^[Yy]$ ]]; then
                         # Remove cronjob first
@@ -1657,7 +1423,7 @@ manage_service() {
                         return
                     fi
                     ;;
-                0)
+                9)
                     break
                     ;;
                 *)
