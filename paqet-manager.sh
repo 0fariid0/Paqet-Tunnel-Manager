@@ -1447,15 +1447,14 @@ manage_services() {
         
         echo -e "${CYAN}└─────┴──────────────────────────┴─────────────┴───────────┴────────────────┴────────────┴──────────┴────────┘${NC}\n"
         echo -e "${YELLOW}Options:${NC}"
-        echo -e "${YELLOW}Options:${NC}"
         echo -e " 0. ↩️ Back to Main Menu"
         echo -e " 1–${#services[@]}. Select a service to manage"
-        echo -e " L. 🧾 Log Management (Level / Cleanup / Live Logs)"
+        echo -e " 00. 🧾 Log Management (Level / Cleanup / Live Logs)"
         echo ""
         
-        read -p "Enter choice (0 to cancel): " choice
+        read -p "Enter choice (0=back, 00=logs): " choice
 
-        if [[ "$choice" =~ ^[Ll]$ ]]; then
+        if [[ "$choice" == "00" || "$choice" =~ ^[Ll]$ ]]; then
             log_management_menu
             continue
         fi
@@ -1688,19 +1687,22 @@ _run_cleanup_now() {
 }
 
 _prompt_log_level() {
-    echo ""
-    echo -e "${YELLOW}Select Log Level:${NC}"
-    echo " 1) debug"
-    echo " 2) info"
-    echo " 3) warn"
-    echo " 4) error"
-    echo ""
-    local c
-    read -p "Choice [1-4] (default 2=info): " c
+    local c=""
+    echo "" >&2
+    echo -e "${YELLOW}Select Log Level:${NC}" >&2
+    echo " 1) debug" >&2
+    echo " 2) info" >&2
+    echo " 3) warn" >&2
+    echo " 4) error" >&2
+    echo "" >&2
+    echo -en "Choice [1-4] (default 2=info): " >&2
+    read -r c
+    c=$(echo "$c" | tr '[:upper:]' '[:lower:]' | xargs)
     case "$c" in
-        1) echo "debug" ;;
-        3) echo "warn" ;;
-        4) echo "error" ;;
+        1|debug) echo "debug" ;;
+        3|warn|warning) echo "warn" ;;
+        4|error|err) echo "error" ;;
+        2|info|"") echo "info" ;;
         *) echo "info" ;;
     esac
 }
