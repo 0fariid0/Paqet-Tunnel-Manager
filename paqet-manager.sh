@@ -875,9 +875,19 @@ _watcher_cfg_file() {
 }
 
 _watcher_ensure_script() {
-    # If the watcher python file is missing, generate it automatically.
+    # Ensure watcher script exists (auto-generate). If an older manager-generated
+    # watcher is found, upgrade it (keep a .bak copy) so improvements apply.
     if [ -f "$WATCHER_SCRIPT" ]; then
-        return 0
+        if grep -q "Watch paqet logs and restart on pattern after grace period" "$WATCHER_SCRIPT" 2>/dev/null; then
+            if grep -q -- "--cooldown" "$WATCHER_SCRIPT" 2>/dev/null; then
+                return 0
+            fi
+            # Old generated watcher detected -> backup then upgrade
+            cp -f "$WATCHER_SCRIPT" "${WATCHER_SCRIPT}.bak.$(date +%s)" 2>/dev/null || true
+        else
+            # User-provided watcher script -> do not overwrite
+            return 0
+        fi
     fi
 
     mkdir -p "$(dirname "$WATCHER_SCRIPT")" 2>/dev/null || true
@@ -886,15 +896,25 @@ _watcher_ensure_script() {
 #!/usr/bin/env python3
 import argparse
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
 
 
+ANSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+
+
+def strip_ansi(s: str) -> str:
+    return ANSI_RE.sub("", s)
+
+
 def terminate_process_group(proc: subprocess.Popen, timeout: int = 5) -> None:
     """Terminate whole process group (paqet + children) safely."""
     try:
+        if proc.poll() is not None:
+            return
         os.killpg(proc.pid, signal.SIGTERM)
         proc.wait(timeout=timeout)
     except Exception:
@@ -904,21 +924,61 @@ def terminate_process_group(proc: subprocess.Popen, timeout: int = 5) -> None:
             pass
 
 
-def run_watch_loop(binary: str, config: str, pattern: str, grace: int, restart_delay: int) -> None:
+def parse_patterns(pattern: str):
+    """
+    Supports multiple patterns separated by '||' (OR).
+    Example: "%!s||panic||fatal"
+    """
+    parts = [p.strip() for p in pattern.split("||")]
+    return [p for p in parts if p]
+
+
+def should_trigger(line: str, patterns) -> bool:
+    if not patterns:
+        return False
+    # Don't accidentally match our own watcher lines
+    if line.startswith("[Watcher]"):
+        return False
+    for p in patterns:
+        if p in line:
+            return True
+    return False
+
+
+def run_watch_loop(binary: str, config: str, pattern: str, grace: int, restart_delay: int, cooldown: int, max_backoff: int, stable_reset: int) -> None:
     cmd = [binary, "run", "-c", config]
+    patterns = parse_patterns(pattern)
+
+    consecutive = 0
+    ignore_until = 0.0
 
     while True:
+        now = time.time()
+        if now < ignore_until:
+            time.sleep(max(0.5, ignore_until - now))
+
+        # Backoff delay grows on repeated restarts due to pattern/exits
+        backoff = min(max_backoff, restart_delay * (2 ** max(0, consecutive - 1)))
+
         print(f"[Watcher] Starting: {' '.join(cmd)}", flush=True)
-        print(f"[Watcher] Ignoring '{pattern}' for first {grace}s", flush=True)
+        if grace > 0:
+            print(f"[Watcher] Grace: ignoring trigger for first {grace}s", flush=True)
+        if patterns:
+            print(f"[Watcher] Trigger patterns: {' || '.join(patterns)}", flush=True)
+        print(f"[Watcher] Cooldown={cooldown}s  MaxBackoff={max_backoff}s  StableReset={stable_reset}s", flush=True)
+        if backoff != restart_delay:
+            print(f"[Watcher] Backoff active: next restart delay = {backoff}s (consecutive={consecutive})", flush=True)
 
         if not os.path.exists(binary):
             print(f"[Watcher] ERROR: binary not found: {binary}", flush=True)
-            time.sleep(5)
+            consecutive = min(consecutive + 1, 20)
+            time.sleep(min(30, backoff))
             continue
 
         if not os.path.exists(config):
             print(f"[Watcher] ERROR: config not found: {config}", flush=True)
-            time.sleep(5)
+            consecutive = min(consecutive + 1, 20)
+            time.sleep(min(30, backoff))
             continue
 
         proc = subprocess.Popen(
@@ -928,46 +988,91 @@ def run_watch_loop(binary: str, config: str, pattern: str, grace: int, restart_d
             text=True,
             bufsize=1,
             start_new_session=True,
+            errors="replace",
         )
 
         start_time = time.time()
-
+        restart_requested = False
         try:
             assert proc.stdout is not None
-            for line in iter(proc.stdout.readline, ""):
-                sys.stdout.write(line)
+            for raw in iter(proc.stdout.readline, ""):
+                # Keep original output in journal, but match on cleaned string
+                sys.stdout.write(raw)
                 sys.stdout.flush()
 
+                line = strip_ansi(raw.rstrip("\n"))
                 elapsed = time.time() - start_time
-                if elapsed >= grace and pattern in line:
-                    print(f"\n[Watcher] Detected pattern after grace ({elapsed:.1f}s). Restarting...", flush=True)
+
+                if elapsed < grace:
+                    continue
+
+                # Cooldown after a restart to avoid flapping on repeated early lines
+                if time.time() < ignore_until:
+                    continue
+
+                if should_trigger(line, patterns):
+                    # If it has been stable for long enough, reset "consecutive" before counting this restart
+                    if stable_reset > 0 and elapsed >= stable_reset:
+                        consecutive = 0
+
+                    consecutive = min(consecutive + 1, 20)
+                    print(f"\n[Watcher] Detected trigger after {elapsed:.1f}s. Restarting (cooldown {cooldown}s)...", flush=True)
                     terminate_process_group(proc)
+                    ignore_until = time.time() + max(0, cooldown)
+                    restart_requested = True
                     break
 
-            if proc.poll() is not None:
-                print(f"[Watcher] Process exited (code={proc.returncode}). Restarting...", flush=True)
+            # If paqet exits by itself, restart (with backoff)
+            if proc.poll() is not None and not restart_requested:
+                elapsed_total = time.time() - start_time
+                if stable_reset > 0 and elapsed_total >= stable_reset:
+                    consecutive = 0
 
+                rc = proc.returncode
+                consecutive = min(consecutive + 1, 20)
+                print(f"[Watcher] Process exited (code={rc}). Restarting (cooldown {cooldown}s)...", flush=True)
+                ignore_until = time.time() + max(0, cooldown)
+
+        except KeyboardInterrupt:
+            print("\n[Watcher] Stopping (Ctrl+C).", flush=True)
+            terminate_process_group(proc)
+            raise
         except Exception as e:
             print(f"[Watcher] ERROR while watching logs: {e}", flush=True)
             terminate_process_group(proc)
+            consecutive = min(consecutive + 1, 20)
+            ignore_until = time.time() + max(0, cooldown)
 
-        time.sleep(restart_delay)
+        time.sleep(max(0, backoff))
 
 
 def main():
     ap = argparse.ArgumentParser(description="Watch paqet logs and restart on pattern after grace period.")
     ap.add_argument("--binary", default="/usr/local/bin/paqet", help="Path to paqet binary")
     ap.add_argument("--config", required=True, help="Path to config yaml (e.g. /etc/paqet/server.yaml)")
-    ap.add_argument("--pattern", default="%!s", help="Error string/pattern to trigger restart")
-    ap.add_argument("--grace", type=int, default=5, help="Grace period seconds")
-    ap.add_argument("--restart-delay", type=int, default=2, help="Seconds to wait before restarting")
+    ap.add_argument("--pattern", default="%!s", help="Trigger string. Use '||' to OR multiple patterns.")
+    ap.add_argument("--grace", type=int, default=5, help="Grace period seconds before triggers are considered")
+    ap.add_argument("--restart-delay", type=int, default=2, help="Base seconds to wait before restarting")
+    ap.add_argument("--cooldown", type=int, default=20, help="Seconds to ignore triggers right after a restart")
+    ap.add_argument("--max-backoff", type=int, default=60, help="Maximum restart delay under backoff (seconds)")
+    ap.add_argument("--stable-reset", type=int, default=300, help="If tunnel stays up >= this many seconds, reset restart backoff counter")
     args = ap.parse_args()
 
-    run_watch_loop(args.binary, args.config, args.pattern, args.grace, args.restart_delay)
+    run_watch_loop(
+        args.binary,
+        args.config,
+        args.pattern,
+        max(0, args.grace),
+        max(0, args.restart_delay),
+        max(0, args.cooldown),
+        max(1, args.max_backoff),
+        max(0, args.stable_reset),
+    )
 
 
 if __name__ == "__main__":
     main()
+
 PYWATCH
 
     chmod +x "$WATCHER_SCRIPT" 2>/dev/null || true
@@ -1118,7 +1223,7 @@ manage_watcher() {
         fi
 
         echo -e "Status: ${CYAN}${enabled}${NC}"
-        echo -e "Config:  grace=${CYAN}${WATCHER_GRACE}s${NC}  delay=${CYAN}${WATCHER_RESTART_DELAY}s${NC}  pattern=${CYAN}${WATCHER_PATTERN}${NC}"
+        echo -e "Config:  grace=${CYAN}${WATCHER_GRACE}s${NC}  delay=${CYAN}${WATCHER_RESTART_DELAY}s${NC}  pattern=${CYAN}${WATCHER_PATTERN}${NC}  ${YELLOW}(tip: use || for OR)${NC}"
         echo ""
 
         echo -e "${CYAN}Actions:${NC}"
@@ -1179,7 +1284,7 @@ manage_watcher() {
                 ;;
             5)
                 echo ""
-                read -p "Pattern (current: ${WATCHER_PATTERN}): " p
+                read -p "Pattern (current: ${WATCHER_PATTERN}) [tip: use || for OR]: " p
                 p="${p:-$WATCHER_PATTERN}"
                 if [ -z "$p" ]; then
                     print_error "Pattern cannot be empty"
