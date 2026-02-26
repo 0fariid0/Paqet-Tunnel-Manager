@@ -60,6 +60,23 @@ readonly DEFAULT_AUTO_RESTART_INTERVAL="1hour"
 readonly DEFAULT_V2RAY_PORTS="9090"
 readonly DEFAULT_SOCKS5_PORT="1080"
 
+# Logging defaults (paqet config) + automatic log cleanup
+readonly DEFAULT_LOG_LEVEL="info"              # debug|info|warn|error
+readonly DEFAULT_JOURNAL_VACUUM_TIME="7d"      # e.g. 7d, 14d, 30d
+readonly DEFAULT_JOURNAL_VACUUM_SIZE="300M"    # e.g. 200M, 1G
+
+# Manager settings file (persists defaults)
+readonly MANAGER_SETTINGS_FILE="${CONFIG_DIR}/manager-settings.conf"
+
+# Extra Paqet core builds
+readonly PAQET_OPTIMIZED_AMD64_URL="https://github.com/0fariid0/Paqet-Tunnel-Manager/releases/download/2.0.0/paqet-linux-amd64-v2.2.0-optimize.tar.gz"
+
+# Runtime settings (loaded from MANAGER_SETTINGS_FILE if present)
+PAQET_DEFAULT_LOG_LEVEL="$DEFAULT_LOG_LEVEL"
+PAQET_JOURNAL_VACUUM_TIME="$DEFAULT_JOURNAL_VACUUM_TIME"
+PAQET_JOURNAL_VACUUM_SIZE="$DEFAULT_JOURNAL_VACUUM_SIZE"
+
+
 # KCP Mode Descriptions
 declare -A KCP_MODES=(
     ["0"]="normal:normal:Normal speed / Normal latency / Low usage"
@@ -149,6 +166,188 @@ print_error() { echo -e "${RED}[✗]${NC} $1"; }
 print_warning() { echo -e "${YELLOW}[!]${NC} $1"; }
 print_info() { echo -e "${CYAN}[i]${NC} $1"; }
 print_input() { echo -e "${YELLOW}[?]${NC} $1"; }
+
+# ================================================
+# MANAGER SETTINGS (Log level + Log cleanup)
+# ================================================
+
+init_manager_settings() {
+    mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+
+    if [ ! -f "$MANAGER_SETTINGS_FILE" ]; then
+        cat > "$MANAGER_SETTINGS_FILE" << EOF
+# Paqet Manager persistent settings
+# This file is sourced by paqet-manager and also used by the log-cleanup systemd service.
+PAQET_DEFAULT_LOG_LEVEL="$DEFAULT_LOG_LEVEL"
+PAQET_JOURNAL_VACUUM_TIME="$DEFAULT_JOURNAL_VACUUM_TIME"
+PAQET_JOURNAL_VACUUM_SIZE="$DEFAULT_JOURNAL_VACUUM_SIZE"
+EOF
+        chmod 600 "$MANAGER_SETTINGS_FILE" 2>/dev/null || true
+    fi
+}
+
+save_manager_settings() {
+    mkdir -p "$CONFIG_DIR" 2>/dev/null || true
+
+    cat > "$MANAGER_SETTINGS_FILE" << EOF
+# Paqet Manager persistent settings
+PAQET_DEFAULT_LOG_LEVEL="$PAQET_DEFAULT_LOG_LEVEL"
+PAQET_JOURNAL_VACUUM_TIME="$PAQET_JOURNAL_VACUUM_TIME"
+PAQET_JOURNAL_VACUUM_SIZE="$PAQET_JOURNAL_VACUUM_SIZE"
+EOF
+    chmod 600 "$MANAGER_SETTINGS_FILE" 2>/dev/null || true
+}
+
+normalize_log_level() {
+    local input="$1"
+    local fallback="${2:-info}"
+
+    input=$(echo "$input" | tr '[:upper:]' '[:lower:]' | xargs)
+
+    case "$input" in
+        1|debug) echo "debug" ;;
+        2|info|"") echo "info" ;;
+        3|warn|warning) echo "warn" ;;
+        4|error|err) echo "error" ;;
+        *) echo "$fallback" ;;
+    esac
+}
+
+load_manager_settings() {
+    init_manager_settings
+
+    if [ -f "$MANAGER_SETTINGS_FILE" ]; then
+        # shellcheck disable=SC1090
+        source "$MANAGER_SETTINGS_FILE" 2>/dev/null || true
+    fi
+
+    [ -n "$PAQET_DEFAULT_LOG_LEVEL" ] || PAQET_DEFAULT_LOG_LEVEL="$DEFAULT_LOG_LEVEL"
+    [ -n "$PAQET_JOURNAL_VACUUM_TIME" ] || PAQET_JOURNAL_VACUUM_TIME="$DEFAULT_JOURNAL_VACUUM_TIME"
+    [ -n "$PAQET_JOURNAL_VACUUM_SIZE" ] || PAQET_JOURNAL_VACUUM_SIZE="$DEFAULT_JOURNAL_VACUUM_SIZE"
+
+    PAQET_DEFAULT_LOG_LEVEL=$(normalize_log_level "$PAQET_DEFAULT_LOG_LEVEL" "$DEFAULT_LOG_LEVEL")
+}
+
+ask_log_level() {
+    local default_level="${1:-info}"
+    local input=""
+
+    echo -e "\n${CYAN}Log Level${NC}"
+    echo -e "────────────────────────────────────────────────────────────────"
+    echo -e "  debug | info | warn | error"
+    echo -en "${YELLOW}Enter log level [${default_level}]: ${NC}"
+    read -r input
+    input="${input:-$default_level}"
+
+    local normalized
+    normalized=$(normalize_log_level "$input" "$default_level")
+
+    if [ "$normalized" != "$(echo "$input" | tr '[:upper:]' '[:lower:]' | xargs)" ] && [[ ! "$input" =~ ^[1-4]$ ]]; then
+        print_warning "Unknown log level '$input' → using '$normalized'"
+    fi
+
+    echo "$normalized"
+}
+
+setup_log_cleanup() {
+    local silent="${1:-false}"
+
+    # systemd is required for this script anyway, but keep it safe
+    command -v systemctl >/dev/null 2>&1 || return 0
+    command -v journalctl >/dev/null 2>&1 || return 0
+
+    init_manager_settings
+    load_manager_settings
+
+    local service_path="/etc/systemd/system/paqet-log-cleanup.service"
+    local timer_path="/etc/systemd/system/paqet-log-cleanup.timer"
+
+    local journalctl_bin
+    journalctl_bin=$(command -v journalctl 2>/dev/null || echo "/usr/bin/journalctl")
+    local bash_bin
+    bash_bin=$(command -v bash 2>/dev/null || echo "/bin/bash")
+
+    # Create/Update service
+    cat > "$service_path" << EOF
+[Unit]
+Description=Paqet Manager - Log Cleanup (journal vacuum) to prevent disk fill
+
+[Service]
+Type=oneshot
+EnvironmentFile=-$MANAGER_SETTINGS_FILE
+ExecStart=$journalctl_bin --rotate
+ExecStart=$journalctl_bin --vacuum-time=\${PAQET_JOURNAL_VACUUM_TIME}
+ExecStart=$journalctl_bin --vacuum-size=\${PAQET_JOURNAL_VACUUM_SIZE}
+# Keep Telegram bot log from growing forever (keeps last 20000 lines)
+ExecStart=$bash_bin -c 'f="/var/log/telegram-paqet-bot.log"; if [ -f "\$f" ]; then tail -n 20000 "\$f" > "\${f}.tmp" 2>/dev/null && cat "\${f}.tmp" > "\$f" 2>/dev/null && rm -f "\${f}.tmp" 2>/dev/null; fi'
+EOF
+
+    # Create/Update timer
+    cat > "$timer_path" << EOF
+[Unit]
+Description=Paqet Manager - Scheduled Log Cleanup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30m
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable --now paqet-log-cleanup.timer >/dev/null 2>&1 || true
+
+    if [ "$silent" != "true" ]; then
+        print_success "Log cleanup timer enabled (daily). Journal: time=${PAQET_JOURNAL_VACUUM_TIME}, size=${PAQET_JOURNAL_VACUUM_SIZE}"
+        print_info "You can check: systemctl status paqet-log-cleanup.timer  |  journalctl --disk-usage"
+    fi
+}
+
+cfg_set_log_level() {
+    local f="$1"
+    local newlevel="$2"
+
+    [ -f "$f" ] || return 1
+    newlevel=$(normalize_log_level "$newlevel" "$DEFAULT_LOG_LEVEL")
+
+    local tmp
+    tmp=$(mktemp 2>/dev/null) || return 1
+
+    awk -v newlevel="$newlevel" '
+        BEGIN { in_log=0; done=0 }
+        /^log:[[:space:]]*$/ {
+            print
+            in_log=1
+            next
+        }
+        in_log && /^[[:space:]]{2}level:/ && done==0 {
+            printf "  level: \"%s\"\n", newlevel
+            done=1
+            next
+        }
+        in_log && /^[^[:space:]]/ {
+            if (done==0) {
+                printf "  level: \"%s\"\n", newlevel
+                done=1
+            }
+            in_log=0
+            print
+            next
+        }
+        { print }
+        END {
+            if (done==0) {
+                if (in_log==0) print "log:"
+                printf "  level: \"%s\"\n", newlevel
+            }
+        }
+    ' "$f" > "$tmp" && mv "$tmp" "$f"
+
+    return 0
+}
+
 
 # Pause with custom message
 pause() {
@@ -1737,13 +1936,17 @@ configure_server() {
         
         configure_iptables "$port" "tcp"
         mkdir -p "$CONFIG_DIR"
+
+# Select log level (default from manager settings)
+local log_level
+log_level=$(ask_log_level "$PAQET_DEFAULT_LOG_LEVEL")
         
         # Build server config with proper indentation
         {
             echo "# Paqet Server Configuration"
             echo "role: \"server\""
             echo "log:"
-            echo "  level: \"info\""
+            echo "  level: \"${log_level}\""
             echo "listen:"
             echo "  addr: \":$port\""
             echo "network:"
@@ -2194,13 +2397,17 @@ configure_client() {
         fi
         
         mkdir -p "$CONFIG_DIR"
+
+# Select log level (default from manager settings)
+local log_level
+log_level=$(ask_log_level "$PAQET_DEFAULT_LOG_LEVEL")
         
         # Build client config with proper indentation
         {
             echo "# Paqet Client Configuration"
             echo "role: \"client\""
             echo "log:"
-            echo "  level: \"info\""
+            echo "  level: \"${log_level}\""
             
             if [ ${#forward_entries[@]} -gt 0 ]; then
                 echo "forward:"
@@ -2875,6 +3082,7 @@ install_paqet() {
     echo -e " 1) ${GREEN}Download/Update from GitHub (latest: $latest_version)${NC}"
     echo -e " 2) ${CYAN}Use local file from /root/paqet/${NC}"
     echo -e " 3) ${PURPLE}Download from custom URL${NC}"
+    echo -e " 8) ${ORANGE}Download optimized core (amd64) [v2.2.0-optimize]${NC}"
     echo -e ""
     echo -e "${GREEN}══════════════════════════════════════════════════════════════${NC}"
     echo -e "${GREEN} paqet manager${NC}"
@@ -2887,7 +3095,7 @@ install_paqet() {
     echo -e ""
     echo -e " 0) ${YELLOW}↩️ Back to main menu${NC}\n"
     
-    read -p "Choose option [0-7]: " install_choice
+    read -p "Choose option [0-8]: " install_choice
     
     case $install_choice in
         1)
@@ -2997,6 +3205,31 @@ install_paqet() {
                 print_success "Downloaded from custom URL"
             fi
             ;;
+
+8)
+    if [ "$arch_name" != "amd64" ]; then
+        print_error "This optimized build is only available for amd64. Your arch: $arch_name"
+        echo -e "${YELLOW}Tip:${NC} Use option 1 for the official GitHub build, or option 3 for a custom URL."
+        pause
+        return 1
+    fi
+
+    print_info "Downloading optimized build (v2.2.0-optimize) from Paqet-Tunnel-Manager release..."
+
+    if ! curl -fsSL "$PAQET_OPTIMIZED_AMD64_URL" -o "/tmp/paqet.tar.gz" 2>/dev/null; then
+        print_error "Download failed"
+        echo -e "\n${YELLOW}URL:${NC} $PAQET_OPTIMIZED_AMD64_URL"
+        pause
+        return 1
+    else
+        print_success "Downloaded optimized build"
+        local opt_filename
+        opt_filename=$(basename "$PAQET_OPTIMIZED_AMD64_URL")
+        cp "/tmp/paqet.tar.gz" "/root/paqet/$opt_filename" 2>/dev/null && \
+        print_info "Saved copy to /root/paqet/$opt_filename for future use"
+    fi
+    ;;
+
         4)
             install_manager_script
             return 0
@@ -3770,12 +4003,18 @@ manage_all_services() {
         echo -e " ${GREEN}[15]${NC} 📦 Change MTU All Services"
         echo -e " ${GREEN}[16]${NC} 🔒 Change Block All Services"
         
+
+echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+echo -e "${YELLOW}📝 LOG MANAGEMENT${NC}"
+echo -e "────────────────────────────────────────────────────────────────"
+echo -e " ${GREEN}[18]${NC} 📝 Change Log Level (Default + Apply to All Configs)"
+echo -e " ${GREEN}[19]${NC} 🧹 Setup/Configure Auto Log Cleanup (Journal + Bot)"
         echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
         echo -e " ${GREEN}[17]${NC} 🗑️  Delete All Tunnels"
         echo -e " ${GREEN}[0]${NC} ↩️ Back to Main Menu"
         echo ""
         
-        read -p "Choose option [0-17]: " mgmt_choice
+        read -p "Choose option [0-19]: " mgmt_choice
         
         case $mgmt_choice in
             1) apply_connection_protection ;;
@@ -3794,6 +4033,8 @@ manage_all_services() {
             14) change_conn_all_services ;;
             15) set_global_mtu ;;
             16) change_block_all_services ;;
+            18) change_log_level_all_services ;;
+            19) configure_log_cleanup_settings ;;
             17) delete_all_tunnels "${services[@]}" ;;
             0) return ;;
             *) print_error "Invalid choice"; sleep 1.5 ;;
@@ -4065,6 +4306,110 @@ change_block_all_services() {
         restart_all_services "${services[@]}"
     fi
     
+    pause
+}
+
+
+# ================================================
+# LOG MANAGEMENT FUNCTIONS
+# ================================================
+
+change_log_level_all_services() {
+    clear
+    echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}Change Log Level (Default + Apply to All Configs)${NC}"
+    echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}\n"
+
+    load_manager_settings
+
+    echo -e "${CYAN}Current default log level:${NC} ${GREEN}${PAQET_DEFAULT_LOG_LEVEL}${NC}"
+
+    local new_level
+    new_level=$(ask_log_level "$PAQET_DEFAULT_LOG_LEVEL")
+    new_level=$(normalize_log_level "$new_level" "$PAQET_DEFAULT_LOG_LEVEL")
+
+    echo -e "\n${GREEN}Selected:${NC} $new_level"
+    PAQET_DEFAULT_LOG_LEVEL="$new_level"
+    save_manager_settings
+    print_success "Default log level saved to: $MANAGER_SETTINGS_FILE"
+
+    read -p "Apply this log level to ALL existing Paqet configs now? (Y/n): " apply_choice
+    apply_choice="${apply_choice:-Y}"
+
+    if [[ "$apply_choice" =~ ^[Yy]$ ]]; then
+        local configs=()
+        while IFS= read -r -d '' file; do
+            configs+=("$file")
+        done < <(find "$CONFIG_DIR" -name "*.yaml" -type f -print0 2>/dev/null)
+
+        if [[ ${#configs[@]} -eq 0 ]]; then
+            print_warning "No YAML configs found in $CONFIG_DIR"
+        else
+            echo -e "\n${YELLOW}Updating ${#configs[@]} config(s)...${NC}"
+            local modified=0
+            for config in "${configs[@]}"; do
+                local config_name
+                config_name=$(basename "$config" .yaml)
+                if cfg_set_log_level "$config" "$new_level"; then
+                    echo -e " ${GREEN}✓${NC} Updated $config_name"
+                    ((modified++))
+                else
+                    echo -e " ${RED}✗${NC} Failed $config_name"
+                fi
+            done
+            echo -e "\n${GREEN}✅ Log level set to '$new_level' on $modified configuration(s)${NC}"
+        fi
+
+        read -p "Restart all Paqet services to apply changes? (y/N): " restart_choice
+        if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
+            local services=()
+            mapfile -t services < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
+                                  grep -E '^paqet-.*\.service' | awk '{print $1}' || true)
+            restart_all_services "${services[@]}"
+        fi
+    fi
+
+    pause
+}
+
+configure_log_cleanup_settings() {
+    clear
+    echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${YELLOW}Setup / Configure Auto Log Cleanup${NC}"
+    echo -e "${YELLOW}══════════════════════════════════════════════════════════════${NC}\n"
+
+    load_manager_settings
+
+    echo -e "${CYAN}This will create/enable a systemd timer that runs daily and:${NC}"
+    echo -e "  • Rotates + vacuums the systemd journal (prevents disk fill)"
+    echo -e "  • Trims Telegram bot log file to keep it small (if exists)"
+    echo ""
+
+    echo -e "${CYAN}Current settings:${NC}"
+    echo -e "  Journal vacuum time : ${GREEN}${PAQET_JOURNAL_VACUUM_TIME}${NC}"
+    echo -e "  Journal max size    : ${GREEN}${PAQET_JOURNAL_VACUUM_SIZE}${NC}"
+    echo ""
+
+    local new_time new_size
+    read -p "Journal retention time (example: 7d, 14d, 30d) [${PAQET_JOURNAL_VACUUM_TIME}]: " new_time
+    read -p "Journal max size (example: 300M, 1G) [${PAQET_JOURNAL_VACUUM_SIZE}]: " new_size
+
+    new_time="${new_time:-$PAQET_JOURNAL_VACUUM_TIME}"
+    new_size="${new_size:-$PAQET_JOURNAL_VACUUM_SIZE}"
+
+    PAQET_JOURNAL_VACUUM_TIME="$new_time"
+    PAQET_JOURNAL_VACUUM_SIZE="$new_size"
+    save_manager_settings
+
+    setup_log_cleanup "false"
+
+    read -p "Run cleanup once right now? (y/N): " run_now
+    if [[ "$run_now" =~ ^[Yy]$ ]]; then
+        systemctl start paqet-log-cleanup.service >/dev/null 2>&1 || true
+        print_success "Cleanup executed. Check disk usage:"
+        echo -e "  ${CYAN}journalctl --disk-usage${NC}"
+    fi
+
     pause
 }
 
@@ -7166,4 +7511,6 @@ main_menu() {
 # ================================================
 
 check_root
+load_manager_settings
+setup_log_cleanup "true"
 main_menu
