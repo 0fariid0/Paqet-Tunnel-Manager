@@ -1313,11 +1313,10 @@ manage_single_service() {
         echo " 8. ⏰ Cronjob Management"
         echo " 9. 👁️  Watcher (Auto Restart on Log Pattern)"
         echo " 10. 🗑️  Delete Service"
-        echo " 11. 📡 Live Logs (Follow)"
         echo " 0. ↩️  Back"
         echo ""
         
-        read -p "Choose action [0-11]: " action
+        read -p "Choose action [0-10]: " action
         
         case "$action" in
             0) return ;;
@@ -1367,9 +1366,6 @@ manage_single_service() {
                pause ;;
             8) manage_cronjob "${selected_service%.service}" "$display_name" ;;
             9) manage_watcher "$selected_service" "$display_name" ;;
-                        11) echo -e "\n${YELLOW}Press Ctrl+C to stop live logs...${NC}\n"
-                journalctl -u "$selected_service" -n 50 -f
-                pause ;;
             10) read -p "Delete this service? (y/N): " confirm
                if [[ "$confirm" =~ ^[Yy]$ ]]; then
                    remove_cronjob "${selected_service%.service}" 2>/dev/null || true
@@ -1596,9 +1592,22 @@ _enable_log_cleanup_defaults() {
 }
 
 _disable_log_cleanup() {
-    rm -f "$JOURNALD_DROPIN_FILE" "$LOGROTATE_TELEGRAM_FILE" >/dev/null 2>&1 || true
+    local removed="yes"
+
+    # Remove both journald limits and telegram logrotate config.
+    rm -f "$LOGROTATE_TELEGRAM_FILE" >/dev/null 2>&1 || removed="no"
+    rm -f "$JOURNALD_DROPIN_FILE" >/dev/null 2>&1 || removed="no"
+
     _log_restart_journald
-    print_success "Auto log cleanup disabled."
+
+    # Verify (so user doesn't feel it's "still on")
+    if [ -f "$JOURNALD_DROPIN_FILE" ] || [ -f "$LOGROTATE_TELEGRAM_FILE" ] || [ "$removed" = "no" ]; then
+        print_warning "Auto log cleanup could not be fully disabled. (Are you running as root?)"
+        [ -f "$JOURNALD_DROPIN_FILE" ] && echo -e "  ${YELLOW}Still present:${NC} $JOURNALD_DROPIN_FILE"
+        [ -f "$LOGROTATE_TELEGRAM_FILE" ] && echo -e "  ${YELLOW}Still present:${NC} $LOGROTATE_TELEGRAM_FILE"
+    else
+        print_success "Auto log cleanup disabled."
+    fi
 }
 
 _configure_log_cleanup() {
@@ -1693,36 +1702,44 @@ _prompt_log_level() {
 }
 
 _log_select_service() {
-    # Echo selected service unit (e.g., paqet-xxx.service) or empty on cancel
+    # Echo selected service unit (e.g., paqet-xxx.service) to STDOUT.
+    # IMPORTANT: All menus/prompts MUST go to STDERR so command substitution
+    # (svc=$(_log_select_service)) doesn't capture them.
     local services=()
-    mapfile -t services < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
-                          grep -E '^paqet-.*\.service' | awk '{print $1}' || true)
+    mapfile -t services < <(
+        systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null \
+        | grep -E '^paqet-.*\.service' | awk '{print $1}' || true
+    )
 
     if [[ ${#services[@]} -eq 0 ]]; then
-        print_warning "No Paqet services found."
-        echo ""
+        print_warning "No Paqet services found." >&2
+        echo "" >&2
         return 1
     fi
 
-    echo -e "\n${CYAN}Select Tunnel:${NC}"
+    echo -e "\n${CYAN}Select Tunnel:${NC}" >&2
     local i=1
     for svc in "${services[@]}"; do
         local display_name="${svc%.service}"
         display_name="${display_name#paqet-}"
         local st
         st=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
-        printf " %2d) %-28s [%s]\n" "$i" "$display_name" "$st"
+        printf " %2d) %-28s [%s]\n" "$i" "$display_name" "$st" >&2
         ((i++))
     done
-    echo " 0) Cancel"
-    echo ""
+    echo " 0) Cancel" >&2
+    echo "" >&2
+
     local choice
     read -p "Choose [0-${#services[@]}]: " choice
     [ "$choice" = "0" ] && return 1
+
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#services[@]} )); then
-        print_error "Invalid selection"
+        print_error "Invalid selection" >&2
         return 1
     fi
+
+    # Only the unit name goes to STDOUT
     echo "${services[$((choice-1))]}"
     return 0
 }
