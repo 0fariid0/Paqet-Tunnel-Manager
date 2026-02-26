@@ -1526,15 +1526,19 @@ _log_show_cleanup_status() {
     local enabled="OFF"
     _log_cleanup_enabled && enabled="ON"
 
-    local maxuse retention
-    maxuse=$(_log_read_kv "$JOURNALD_DROPIN_FILE" "SystemMaxUse")
-    retention=$(_log_read_kv "$JOURNALD_DROPIN_FILE" "MaxRetentionSec")
-
-    maxuse="${maxuse:-$DEFAULT_JOURNAL_MAX_USE}"
-    retention="${retention:-$DEFAULT_JOURNAL_RETENTION}"
-
     echo -e "${CYAN}Auto Log Cleanup:${NC} ${GREEN}${enabled}${NC}"
-    echo -e "${CYAN}Journald Limits:${NC} SystemMaxUse=${YELLOW}${maxuse}${NC}  |  MaxRetentionSec=${YELLOW}${retention}${NC}"
+
+    if [ -f "$JOURNALD_DROPIN_FILE" ]; then
+        local maxuse retention
+        maxuse=$(_log_read_kv "$JOURNALD_DROPIN_FILE" "SystemMaxUse")
+        retention=$(_log_read_kv "$JOURNALD_DROPIN_FILE" "MaxRetentionSec")
+        maxuse="${maxuse:-$DEFAULT_JOURNAL_MAX_USE}"
+        retention="${retention:-$DEFAULT_JOURNAL_RETENTION}"
+        echo -e "${CYAN}Journald Limits:${NC} SystemMaxUse=${YELLOW}${maxuse}${NC}  |  MaxRetentionSec=${YELLOW}${retention}${NC}"
+    else
+        echo -e "${CYAN}Journald Limits:${NC} ${YELLOW}OFF${NC} (file not installed)"
+    fi
+
     if [ -f "$LOGROTATE_TELEGRAM_FILE" ]; then
         local freq rotate_count size
         freq=$(grep -E '^\s*(daily|weekly|monthly|yearly)\s*$' "$LOGROTATE_TELEGRAM_FILE" 2>/dev/null | head -n 1 | xargs)
