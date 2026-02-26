@@ -1311,12 +1311,13 @@ manage_single_service() {
         echo " 6. ✏️  Edit Configuration"
         echo " 7. 📄 View Configuration"
         echo " 8. ⏰ Cronjob Management"
-        echo " 9. 👁️  Watcher (Auto Restart on %!s)"
+        echo " 9. 👁️  Watcher (Auto Restart on Log Pattern)"
         echo " 10. 🗑️  Delete Service"
+        echo " 11. 📡 Live Logs (Follow)"
         echo " 0. ↩️  Back"
         echo ""
         
-        read -p "Choose action [0-10]: " action
+        read -p "Choose action [0-11]: " action
         
         case "$action" in
             0) return ;;
@@ -1366,6 +1367,9 @@ manage_single_service() {
                pause ;;
             8) manage_cronjob "${selected_service%.service}" "$display_name" ;;
             9) manage_watcher "$selected_service" "$display_name" ;;
+                        11) echo -e "\n${YELLOW}Press Ctrl+C to stop live logs...${NC}\n"
+                journalctl -u "$selected_service" -n 50 -f
+                pause ;;
             10) read -p "Delete this service? (y/N): " confirm
                if [[ "$confirm" =~ ^[Yy]$ ]]; then
                    remove_cronjob "${selected_service%.service}" 2>/dev/null || true
@@ -1447,12 +1451,19 @@ manage_services() {
         
         echo -e "${CYAN}└─────┴──────────────────────────┴─────────────┴───────────┴────────────────┴────────────┴──────────┴────────┘${NC}\n"
         echo -e "${YELLOW}Options:${NC}"
+        echo -e "${YELLOW}Options:${NC}"
         echo -e " 0. ↩️ Back to Main Menu"
         echo -e " 1–${#services[@]}. Select a service to manage"
+        echo -e " L. 🧾 Log Management (Level / Cleanup / Live Logs)"
         echo ""
         
         read -p "Enter choice (0 to cancel): " choice
-        
+
+        if [[ "$choice" =~ ^[Ll]$ ]]; then
+            log_management_menu
+            continue
+        fi
+
         [ "$choice" = "0" ] && return
         
         if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#services[@]} )); then
@@ -1465,6 +1476,379 @@ manage_services() {
         local service_name="${selected_service%.service}"
         local display_name="${service_name#paqet-}"
         manage_single_service "$selected_service" "$display_name"
+    done
+}
+
+
+# ================================================
+# LOG MANAGEMENT (Per-Tunnel Log Level / Live Logs / Cleanup)
+# ================================================
+
+# Journald + logrotate (no extra systemd services created)
+JOURNALD_DROPIN_DIR="/etc/systemd/journald.conf.d"
+JOURNALD_DROPIN_FILE="$JOURNALD_DROPIN_DIR/99-paqet-manager.conf"
+LOGROTATE_TELEGRAM_FILE="/etc/logrotate.d/telegram-paqet-bot"
+
+DEFAULT_JOURNAL_MAX_USE="300M"
+DEFAULT_JOURNAL_RETENTION="7day"
+DEFAULT_TELEGRAM_ROTATE_COUNT="7"
+DEFAULT_TELEGRAM_ROTATE_FREQ="daily"
+DEFAULT_TELEGRAM_ROTATE_SIZE="50M"
+
+cleanup_legacy_log_services() {
+    # Remove old log-cleanup units created by older script versions (so they don't show as paqet-*.service)
+    if systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -qx "paqet-log-cleanup.service" \
+       || [ -f "$SERVICE_DIR/paqet-log-cleanup.service" ] || [ -f "$SERVICE_DIR/paqet-log-cleanup.timer" ]; then
+        systemctl disable --now paqet-log-cleanup.timer >/dev/null 2>&1 || true
+        systemctl disable --now paqet-log-cleanup.service >/dev/null 2>&1 || true
+        rm -f "$SERVICE_DIR/paqet-log-cleanup.service" "$SERVICE_DIR/paqet-log-cleanup.timer" >/dev/null 2>&1 || true
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+}
+
+_safe_backup_file() {
+    local f="$1"
+    [ -f "$f" ] || return 0
+    mkdir -p "$BACKUP_DIR" >/dev/null 2>&1 || true
+    local ts
+    ts=$(date +%Y%m%d-%H%M%S)
+    cp -a "$f" "$BACKUP_DIR/$(basename "$f").bak-$ts" >/dev/null 2>&1 || true
+}
+
+_log_cleanup_enabled() {
+    [ -f "$JOURNALD_DROPIN_FILE" ] || [ -f "$LOGROTATE_TELEGRAM_FILE" ]
+}
+
+_log_read_kv() {
+    # usage: _log_read_kv <file> <key>
+    local f="$1" k="$2"
+    [ -f "$f" ] || return 1
+    grep -E "^[[:space:]]*${k}=" "$f" 2>/dev/null | tail -n 1 | cut -d'=' -f2- | xargs
+}
+
+_log_show_cleanup_status() {
+    local enabled="OFF"
+    _log_cleanup_enabled && enabled="ON"
+
+    local maxuse retention
+    maxuse=$(_log_read_kv "$JOURNALD_DROPIN_FILE" "SystemMaxUse")
+    retention=$(_log_read_kv "$JOURNALD_DROPIN_FILE" "MaxRetentionSec")
+
+    maxuse="${maxuse:-$DEFAULT_JOURNAL_MAX_USE}"
+    retention="${retention:-$DEFAULT_JOURNAL_RETENTION}"
+
+    echo -e "${CYAN}Auto Log Cleanup:${NC} ${GREEN}${enabled}${NC}"
+    echo -e "${CYAN}Journald Limits:${NC} SystemMaxUse=${YELLOW}${maxuse}${NC}  |  MaxRetentionSec=${YELLOW}${retention}${NC}"
+    if [ -f "$LOGROTATE_TELEGRAM_FILE" ]; then
+        local freq rotate_count size
+        freq=$(grep -E '^\s*(daily|weekly|monthly|yearly)\s*$' "$LOGROTATE_TELEGRAM_FILE" 2>/dev/null | head -n 1 | xargs)
+        rotate_count=$(grep -E '^\s*rotate\s+' "$LOGROTATE_TELEGRAM_FILE" 2>/dev/null | head -n 1 | awk '{print $2}')
+        size=$(grep -E '^\s*size\s+' "$LOGROTATE_TELEGRAM_FILE" 2>/dev/null | head -n 1 | awk '{print $2}')
+        freq="${freq:-$DEFAULT_TELEGRAM_ROTATE_FREQ}"
+        rotate_count="${rotate_count:-$DEFAULT_TELEGRAM_ROTATE_COUNT}"
+        size="${size:-$DEFAULT_TELEGRAM_ROTATE_SIZE}"
+        echo -e "${CYAN}Bot Logrotate:${NC} freq=${YELLOW}${freq}${NC}  |  rotate=${YELLOW}${rotate_count}${NC}  |  size=${YELLOW}${size}${NC}"
+    else
+        echo -e "${CYAN}Bot Logrotate:${NC} ${YELLOW}OFF${NC} (file not installed)"
+    fi
+}
+
+_log_restart_journald() {
+    systemctl restart systemd-journald >/dev/null 2>&1 || true
+}
+
+_log_write_journald_dropin() {
+    local maxuse="$1"
+    local retention="$2"
+    mkdir -p "$JOURNALD_DROPIN_DIR" >/dev/null 2>&1 || true
+
+    cat > "$JOURNALD_DROPIN_FILE" << EOF
+[Journal]
+SystemMaxUse=$maxuse
+MaxRetentionSec=$retention
+EOF
+    _log_restart_journald
+}
+
+_log_write_telegram_logrotate() {
+    local freq="$1"
+    local rotate_count="$2"
+    local size="$3"
+
+    cat > "$LOGROTATE_TELEGRAM_FILE" << EOF
+/var/log/telegram-paqet-bot.log {
+    $freq
+    rotate $rotate_count
+    size $size
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+EOF
+}
+
+_enable_log_cleanup_defaults() {
+    _log_write_journald_dropin "$DEFAULT_JOURNAL_MAX_USE" "$DEFAULT_JOURNAL_RETENTION"
+    _log_write_telegram_logrotate "$DEFAULT_TELEGRAM_ROTATE_FREQ" "$DEFAULT_TELEGRAM_ROTATE_COUNT" "$DEFAULT_TELEGRAM_ROTATE_SIZE"
+    print_success "Auto log cleanup enabled (journald limits + bot logrotate)."
+}
+
+_disable_log_cleanup() {
+    rm -f "$JOURNALD_DROPIN_FILE" "$LOGROTATE_TELEGRAM_FILE" >/dev/null 2>&1 || true
+    _log_restart_journald
+    print_success "Auto log cleanup disabled."
+}
+
+_configure_log_cleanup() {
+    clear
+    show_banner
+    echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}║                  Configure Auto Log Cleanup                  ║${NC}"
+    echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}\n"
+
+    local cur_maxuse cur_retention
+    cur_maxuse=$(_log_read_kv "$JOURNALD_DROPIN_FILE" "SystemMaxUse")
+    cur_retention=$(_log_read_kv "$JOURNALD_DROPIN_FILE" "MaxRetentionSec")
+    cur_maxuse="${cur_maxuse:-$DEFAULT_JOURNAL_MAX_USE}"
+    cur_retention="${cur_retention:-$DEFAULT_JOURNAL_RETENTION}"
+
+    echo -e "${CYAN}Current journald limits:${NC} SystemMaxUse=${YELLOW}${cur_maxuse}${NC}, MaxRetentionSec=${YELLOW}${cur_retention}${NC}"
+    echo -e "${YELLOW}Tips:${NC} Examples: 300M, 1G  |  retention: 7day, 14day, 1month"
+    echo ""
+
+    local maxuse retention
+    read -p "SystemMaxUse (default: ${cur_maxuse}): " maxuse
+    read -p "MaxRetentionSec (default: ${cur_retention}): " retention
+    maxuse="${maxuse:-$cur_maxuse}"
+    retention="${retention:-$cur_retention}"
+
+    echo ""
+    echo -e "${CYAN}Bot logrotate settings (telegram-paqet-bot.log):${NC}"
+    local freq rotate_count size
+    freq=$(grep -E '^\s*(daily|weekly|monthly|yearly)\s*$' "$LOGROTATE_TELEGRAM_FILE" 2>/dev/null | head -n 1 | xargs)
+    rotate_count=$(grep -E '^\s*rotate\s+' "$LOGROTATE_TELEGRAM_FILE" 2>/dev/null | head -n 1 | awk '{print $2}')
+    size=$(grep -E '^\s*size\s+' "$LOGROTATE_TELEGRAM_FILE" 2>/dev/null | head -n 1 | awk '{print $2}')
+    freq="${freq:-$DEFAULT_TELEGRAM_ROTATE_FREQ}"
+    rotate_count="${rotate_count:-$DEFAULT_TELEGRAM_ROTATE_COUNT}"
+    size="${size:-$DEFAULT_TELEGRAM_ROTATE_SIZE}"
+
+    echo -e "${CYAN}Current:${NC} freq=${YELLOW}${freq}${NC}, rotate=${YELLOW}${rotate_count}${NC}, size=${YELLOW}${size}${NC}"
+    echo -e "${YELLOW}freq options:${NC} daily / weekly / monthly"
+    echo ""
+
+    read -p "freq (default: ${freq}): " freq_in
+    read -p "rotate count (default: ${rotate_count}): " rotate_in
+    read -p "size threshold (default: ${size}): " size_in
+
+    freq="${freq_in:-$freq}"
+    rotate_count="${rotate_in:-$rotate_count}"
+    size="${size_in:-$size}"
+
+    _log_write_journald_dropin "$maxuse" "$retention"
+    _log_write_telegram_logrotate "$freq" "$rotate_count" "$size"
+
+    print_success "Auto log cleanup configuration updated."
+    pause
+}
+
+_run_cleanup_now() {
+    local maxuse retention
+    maxuse=$(_log_read_kv "$JOURNALD_DROPIN_FILE" "SystemMaxUse")
+    retention=$(_log_read_kv "$JOURNALD_DROPIN_FILE" "MaxRetentionSec")
+    maxuse="${maxuse:-$DEFAULT_JOURNAL_MAX_USE}"
+    retention="${retention:-$DEFAULT_JOURNAL_RETENTION}"
+
+    journalctl --rotate >/dev/null 2>&1 || true
+    # journalctl accepts time in many formats; use retention as-is (often works), fallback to 7d.
+    journalctl --vacuum-size="$maxuse" >/dev/null 2>&1 || true
+    journalctl --vacuum-time="$retention" >/dev/null 2>&1 || journalctl --vacuum-time="7d" >/dev/null 2>&1 || true
+
+    if command -v logrotate >/dev/null 2>&1 && [ -f "$LOGROTATE_TELEGRAM_FILE" ]; then
+        logrotate -f "$LOGROTATE_TELEGRAM_FILE" >/dev/null 2>&1 || true
+    fi
+
+    print_success "Cleanup executed. (journal rotated/vacuumed, bot logrotate forced if configured)"
+    echo -e "  ${CYAN}journalctl --disk-usage${NC}"
+    pause
+}
+
+_prompt_log_level() {
+    echo ""
+    echo -e "${YELLOW}Select Log Level:${NC}"
+    echo " 1) debug"
+    echo " 2) info"
+    echo " 3) warn"
+    echo " 4) error"
+    echo ""
+    local c
+    read -p "Choice [1-4] (default 2=info): " c
+    case "$c" in
+        1) echo "debug" ;;
+        3) echo "warn" ;;
+        4) echo "error" ;;
+        *) echo "info" ;;
+    esac
+}
+
+_log_select_service() {
+    # Echo selected service unit (e.g., paqet-xxx.service) or empty on cancel
+    local services=()
+    mapfile -t services < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
+                          grep -E '^paqet-.*\.service' | awk '{print $1}' || true)
+
+    if [[ ${#services[@]} -eq 0 ]]; then
+        print_warning "No Paqet services found."
+        echo ""
+        return 1
+    fi
+
+    echo -e "\n${CYAN}Select Tunnel:${NC}"
+    local i=1
+    for svc in "${services[@]}"; do
+        local display_name="${svc%.service}"
+        display_name="${display_name#paqet-}"
+        local st
+        st=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
+        printf " %2d) %-28s [%s]\n" "$i" "$display_name" "$st"
+        ((i++))
+    done
+    echo " 0) Cancel"
+    echo ""
+    local choice
+    read -p "Choose [0-${#services[@]}]: " choice
+    [ "$choice" = "0" ] && return 1
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#services[@]} )); then
+        print_error "Invalid selection"
+        return 1
+    fi
+    echo "${services[$((choice-1))]}"
+    return 0
+}
+
+_change_log_level_one_or_all() {
+    local services=()
+    mapfile -t services < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
+                          grep -E '^paqet-.*\.service' | awk '{print $1}' || true)
+
+    if [[ ${#services[@]} -eq 0 ]]; then
+        print_warning "No Paqet services found."
+        pause
+        return
+    fi
+
+    echo -e "\n${YELLOW}Apply log level to:${NC}"
+    echo " 1) All tunnels"
+    echo " 2) One tunnel"
+    echo " 0) Cancel"
+    echo ""
+    local target
+    read -p "Choice [0-2]: " target
+    [ "$target" = "0" ] && return
+
+    local level
+    level=$(_prompt_log_level)
+
+    local selected=()
+    if [ "$target" = "1" ]; then
+        selected=("${services[@]}")
+    elif [ "$target" = "2" ]; then
+        local svc
+        svc=$(_log_select_service) || { pause; return; }
+        selected=("$svc")
+    else
+        print_error "Invalid choice"
+        sleep 1
+        return
+    fi
+
+    local ok=0 fail=0
+    for svc in "${selected[@]}"; do
+        local tunnel="${svc%.service}"
+        tunnel="${tunnel#paqet-}"
+        local cfg="$CONFIG_DIR/$tunnel.yaml"
+        if [ ! -f "$cfg" ]; then
+            ((fail++))
+            continue
+        fi
+        _safe_backup_file "$cfg"
+        if cfg_set_log_level "$cfg" "$level" >/dev/null 2>&1; then
+            ((ok++))
+        else
+            ((fail++))
+        fi
+    done
+
+    print_success "Log level set to '${level}'  (OK: $ok, Failed: $fail)"
+    echo ""
+    read -p "Restart affected services now? (y/N): " r
+    if [[ "$r" =~ ^[Yy]$ ]]; then
+        for svc in "${selected[@]}"; do
+            systemctl restart "$svc" >/dev/null 2>&1 || true
+        done
+        print_success "Restart command sent."
+    fi
+    pause
+}
+
+_view_recent_logs_selected() {
+    local svc
+    svc=$(_log_select_service) || { pause; return; }
+    echo -e "\n${YELLOW}Recent logs for ${svc}:${NC}\n"
+    journalctl -u "$svc" -n 50 --no-pager
+    pause
+}
+
+_live_logs_selected() {
+    local svc
+    svc=$(_log_select_service) || { pause; return; }
+    echo -e "\n${YELLOW}Live logs for ${svc} (Ctrl+C to stop)${NC}\n"
+    journalctl -u "$svc" -n 50 -f
+    pause
+}
+
+log_management_menu() {
+    # Make sure legacy units don't pollute the service list
+    cleanup_legacy_log_services
+
+    while true; do
+        clear
+        show_banner
+
+        echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${GREEN}║                       Log Management                         ║${NC}"
+        echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}\n"
+
+        _log_show_cleanup_status
+        echo ""
+
+        echo -e "${YELLOW}Options:${NC}"
+        echo -e " 1) 📝 Change Log Level (One / All tunnels)"
+        echo -e " 2) 📡 Live Logs (Select tunnel)"
+        echo -e " 3) 🧾 Recent Logs (Select tunnel)"
+        echo -e " 4) 🧹 Enable Auto Log Cleanup"
+        echo -e " 5) 🛑 Disable Auto Log Cleanup"
+        echo -e " 6) ⚙️  Configure Auto Log Cleanup Settings"
+        echo -e " 7) ▶️  Run Cleanup Now"
+        echo -e " 8) 📦 Show Journal Disk Usage"
+        echo -e " 0) ↩️  Back"
+        echo ""
+
+        local c
+        read -p "Choose [0-8]: " c
+        case "$c" in
+            0) return ;;
+            1) _change_log_level_one_or_all ;;
+            2) _live_logs_selected ;;
+            3) _view_recent_logs_selected ;;
+            4) _enable_log_cleanup_defaults; pause ;;
+            5) _disable_log_cleanup; pause ;;
+            6) _configure_log_cleanup ;;
+            7) _run_cleanup_now ;;
+            8) echo ""; journalctl --disk-usage; pause ;;
+            *) print_error "Invalid choice"; sleep 1 ;;
+        esac
     done
 }
 
@@ -4003,18 +4387,12 @@ manage_all_services() {
         echo -e " ${GREEN}[15]${NC} 📦 Change MTU All Services"
         echo -e " ${GREEN}[16]${NC} 🔒 Change Block All Services"
         
-
-echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
-echo -e "${YELLOW}📝 LOG MANAGEMENT${NC}"
-echo -e "────────────────────────────────────────────────────────────────"
-echo -e " ${GREEN}[18]${NC} 📝 Change Log Level (Default + Apply to All Configs)"
-echo -e " ${GREEN}[19]${NC} 🧹 Setup/Configure Auto Log Cleanup (Journal + Bot)"
         echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
         echo -e " ${GREEN}[17]${NC} 🗑️  Delete All Tunnels"
         echo -e " ${GREEN}[0]${NC} ↩️ Back to Main Menu"
         echo ""
         
-        read -p "Choose option [0-19]: " mgmt_choice
+        read -p "Choose option [0-17]: " mgmt_choice
         
         case $mgmt_choice in
             1) apply_connection_protection ;;
@@ -4033,8 +4411,6 @@ echo -e " ${GREEN}[19]${NC} 🧹 Setup/Configure Auto Log Cleanup (Journal + Bot
             14) change_conn_all_services ;;
             15) set_global_mtu ;;
             16) change_block_all_services ;;
-            18) change_log_level_all_services ;;
-            19) configure_log_cleanup_settings ;;
             17) delete_all_tunnels "${services[@]}" ;;
             0) return ;;
             *) print_error "Invalid choice"; sleep 1.5 ;;
@@ -7511,6 +7887,5 @@ main_menu() {
 # ================================================
 
 check_root
-load_manager_settings
-setup_log_cleanup "true"
+cleanup_legacy_log_services
 main_menu
