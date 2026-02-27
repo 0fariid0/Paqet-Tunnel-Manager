@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # Paqet Tunnel Manager
-# Version: 7.1
+# Version: 8.1
 # Raw packet-level tunneling for bypassing network restrictions
 # GitHub: https://github.com/hanselime/paqet
 # Manager GitHub: https://github.com/0fariid0/Paqet-Tunnel-Manager
@@ -24,7 +24,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="7.1"
+readonly SCRIPT_VERSION="8.1"
 readonly MANAGER_NAME="paqet-manager"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 
@@ -1328,6 +1328,23 @@ manage_watcher() {
                     _watcher_apply_override "$selected_service" "$tunnel"
                 fi
                 _watcher_pause
+                ;;
+            12)
+                echo -e "\n${YELLOW}Enter Paqet auto-start interval in seconds (0-3600). 0 = OFF:${NC}"
+                read -p "> " new_interval
+                if [[ "$new_interval" =~ ^[0-9]+$ ]] && [ "$new_interval" -ge 0 ] && [ "$new_interval" -le 3600 ]; then
+                    AUTO_START_INTERVAL="$new_interval"
+                    save_bot_config
+                    print_success "Auto-start interval set to ${AUTO_START_INTERVAL}s"
+                    if systemctl is-active --quiet $BOT_SERVICE; then
+                        systemctl restart $BOT_SERVICE
+                        print_info "Bot service restarted to apply new interval"
+                    fi
+                    sleep 1
+                else
+                    print_error "Invalid interval (0-3600)"
+                    sleep 2
+                fi
                 ;;
             4)
                 echo ""
@@ -4517,6 +4534,10 @@ manage_all_services() {
         echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
         echo -e "${GREEN}║                 Manage All Paqet Services                    ║${NC}"
         echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}\n"
+        # Bot self-heal setting (auto-start) is stored in bot config
+        init_bot_config
+        load_bot_config
+
         
         local services=()
         mapfile -t services < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
@@ -4576,6 +4597,7 @@ manage_all_services() {
         echo -e "────────────────────────────────────────────────────────────────"
         echo -e " ${GREEN}[11]${NC} 📋 Live Log Monitoring (All Services)"
         echo -e " ${GREEN}[12]${NC} 📊 Test MTU / Packet Loss"
+        echo -e " ${GREEN}[18]${NC} 🛟 Auto-start Interval (current: ${CYAN}${AUTO_START_INTERVAL:-5}s${NC}) [0=OFF]"
         
         echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
         echo -e "${YELLOW}⚙️  BULK CONFIGURATION${NC}"
@@ -4590,7 +4612,7 @@ manage_all_services() {
         echo -e " ${GREEN}[0]${NC} ↩️ Back to Main Menu"
         echo ""
         
-        read -p "Choose option [0-17]: " mgmt_choice
+        read -p "Choose option [0-18]: " mgmt_choice
         
         case $mgmt_choice in
             1) apply_connection_protection ;;
@@ -4605,6 +4627,23 @@ manage_all_services() {
             10) restart_all_services "${services[@]}" ;;
             11) live_log_all_services "${services[@]}" ;;
             12) test_mtu ;;
+            18)
+                echo -e "\n${YELLOW}Enter Paqet auto-start interval in seconds (0-3600). 0 = OFF:${NC}"
+                read -p "> " new_interval
+                if [[ "$new_interval" =~ ^[0-9]+$ ]] && [ "$new_interval" -ge 0 ] && [ "$new_interval" -le 3600 ]; then
+                    AUTO_START_INTERVAL="$new_interval"
+                    save_bot_config
+                    print_success "Auto-start interval set to ${AUTO_START_INTERVAL}s"
+                    if systemctl is-active --quiet $BOT_SERVICE 2>/dev/null; then
+                        systemctl restart $BOT_SERVICE >/dev/null 2>&1 || true
+                        print_info "Bot service restarted to apply new interval"
+                    fi
+                    sleep 1
+                else
+                    print_error "Invalid interval (0-3600)"
+                    sleep 2
+                fi
+                ;;
             13) change_mode_all_services ;;
             14) change_conn_all_services ;;
             15) set_global_mtu ;;
@@ -6126,6 +6165,7 @@ ENABLE_BOOT_REPORT="true"
 ENABLE_SERVICE_WATCH="true"
 WATCH_INTERVAL="2"
 TG_CONNECTIVITY_INTERVAL="10"
+AUTO_START_INTERVAL="5"
 SOCKS5_PROXY=""
 USE_SOCKS5="false"
 EOF
@@ -6143,6 +6183,7 @@ load_bot_config() {
         : "${ENABLE_SERVICE_WATCH:=true}"
         : "${WATCH_INTERVAL:=2}"
         : "${TG_CONNECTIVITY_INTERVAL:=10}"
+        : "${AUTO_START_INTERVAL:=5}"
         : "${SOCKS5_PROXY:=}"
         : "${USE_SOCKS5:=false}"
     else
@@ -6153,6 +6194,7 @@ load_bot_config() {
         ENABLE_SERVICE_WATCH="true"
         WATCH_INTERVAL="2"
         TG_CONNECTIVITY_INTERVAL="10"
+        AUTO_START_INTERVAL="5"
         SOCKS5_PROXY=""
         USE_SOCKS5="false"
     fi
@@ -6170,6 +6212,7 @@ ENABLE_BOOT_REPORT="$ENABLE_BOOT_REPORT"
 ENABLE_SERVICE_WATCH="$ENABLE_SERVICE_WATCH"
 WATCH_INTERVAL="$WATCH_INTERVAL"
 TG_CONNECTIVITY_INTERVAL="$TG_CONNECTIVITY_INTERVAL"
+AUTO_START_INTERVAL="$AUTO_START_INTERVAL"
 SOCKS5_PROXY="$SOCKS5_PROXY"
 USE_SOCKS5="$USE_SOCKS5"
 EOF
@@ -6388,6 +6431,7 @@ load_config() {
     : "${ENABLE_SERVICE_WATCH:=true}"
     : "${WATCH_INTERVAL:=2}"
     : "${TG_CONNECTIVITY_INTERVAL:=10}"   # seconds; 0 disables
+    : "${AUTO_START_INTERVAL:=5}"      # seconds; 0 disables
     : "${SOCKS5_PROXY:=}"
     : "${USE_SOCKS5:=false}"
 }
@@ -6975,7 +7019,7 @@ svc_view_config() {
 }
 
 page_home() {
-    echo -e "🤖 <b>Paqet Bot Panel</b>\n\nاز منو انتخاب کن."
+    echo -e "🤖 <b>Paqet Bot Panel</b>\n\nیکی از تونل‌ها رو انتخاب کن."
 }
 
 format_all_status() {
@@ -7011,12 +7055,26 @@ page_service() {
 # Keyboards
 # -----------------------------
 kb_main() {
-    cat << 'JSON'
-{"inline_keyboard":[
-  [{"text":"🧰 سرویس‌ها","callback_data":"menu:services"}],
-  [{"text":"➕ بیشتر","callback_data":"menu:more"}]
-]}
-JSON
+    # Main menu: show services directly + More button
+    local units_json
+    units_json="$(list_paqet_services | jq -R . | jq -s .)"
+
+    jq -nc --argjson units "$units_json" '
+        def rows($arr):
+            if ($arr|length)==0 then
+                [[{"text":"➕ بیشتر","callback_data":"menu:more"}]]
+            else
+                ([range(0; ($arr|length); 2) as $i |
+                    ($arr[$i:$i+2]
+                        | map({
+                            "text": (.|sub("\.service$";"")),
+                            "callback_data": ("svc:" + . + ":menu")
+                        })
+                    )
+                ] + [[{"text":"➕ بیشتر","callback_data":"menu:more"}]])
+            end;
+        {inline_keyboard: rows($units)}
+    '
 }
 
 kb_back_home() {
@@ -7044,6 +7102,7 @@ kb_settings() {
     cat << 'JSON'
 {"inline_keyboard":[
   [{"text":"🔌 Telegram Check Interval","callback_data":"settings:set:tg_interval"}],
+  [{"text":"🛟 Auto-start Interval","callback_data":"settings:set:auto_start_interval"}],
   [{"text":"⏱ Watch Interval","callback_data":"settings:set:watch_interval"}],
   [{"text":"⬅️ بازگشت","callback_data":"menu:more"}]
 ]}
@@ -7077,7 +7136,7 @@ kb_service_panel() {
   [{"text":"📝 View Recent Logs","callback_data":"svc:${unit}:logs"},{"text":"📄 View Configuration","callback_data":"svc:${unit}:viewcfg"}],
   [{"text":"⏰ Cronjob Management","callback_data":"cron:${unit}:menu"}],
   [{"text":"✏️ ویرایش کانفیگ","callback_data":"cfg:${unit}:menu"}],
-  [{"text":"⬅️ لیست سرویس‌ها","callback_data":"menu:services"},{"text":"🏠 منوی اصلی","callback_data":"menu:home"}]
+  [{"text":"⬅️ سرویس‌ها","callback_data":"menu:home"},{"text":"🏠 منوی اصلی","callback_data":"menu:home"}]
 ]}
 JSON
 }
@@ -7258,9 +7317,11 @@ page_settings() {
     local msg="⚙️ <b>تنظیمات ربات</b>\n\n"
     msg+="⏱ Watch Interval: <code>${WATCH_INTERVAL}s</code>\n"
     msg+="🔌 Telegram Check Interval: <code>${TG_CONNECTIVITY_INTERVAL}s</code>\n"
+    msg+="🛟 Auto-start Interval: <code>${AUTO_START_INTERVAL}s</code>\n"
     msg+="(۰ یعنی خاموش)\n\n"
     msg+="راهنما:\n"
     msg+="• اگر اتصال تلگرام قطع بشه، ربات سرویس‌های Paqet رو ری‌استارت می‌کنه.\n"
+    msg+="• اگر تونل خاموش بشه، با Auto-start تلاش می‌کنه روشنش کنه.\n"
     echo -e "$msg"
 }
 
@@ -7355,6 +7416,17 @@ restart_all_paqet_services() {
     done < <(list_paqet_services)
 }
 
+ensure_paqet_services_running() {
+    # Try to start inactive paqet services (no message spam)
+    while read -r u; do
+        [ -z "$u" ] && continue
+        if ! systemctl is-active --quiet "$u" 2>/dev/null; then
+            systemctl start "$u" >/dev/null 2>&1 || systemctl restart "$u" >/dev/null 2>&1 || true
+        fi
+    done < <(list_paqet_services)
+}
+
+
 tg_ping_quick() {
     # Try getMe quickly (workers/direct and socks)
     local resp=""
@@ -7414,6 +7486,23 @@ handle_message_text() {
                         sed -i "s/^TG_CONNECTIVITY_INTERVAL=.*/TG_CONNECTIVITY_INTERVAL=\"${v}\"/" "$BOT_CONFIG"
                     else
                         echo "TG_CONNECTIVITY_INTERVAL=\"${v}\"" >> "$BOT_CONFIG"
+                    fi
+                    pending_clear
+                    load_config
+                    send_message "$chat_id" "✅ تنظیم شد.\n\n$(page_settings)" "$(kb_settings)"
+                    return 0
+                    ;;
+                auto_start_interval)
+                    local v
+                    v="$(echo "$trimmed" | tr -d '[:space:]' | tr -d '"')"
+                    if ! [[ "$v" =~ ^[0-9]+$ ]] || [ "$v" -gt 3600 ]; then
+                        send_message "$chat_id" "❌ مقدار نامعتبره. عدد ثانیه (0 تا 3600).\nلغو: <code>لغو</code>" ""
+                        return 0
+                    fi
+                    if grep -q '^AUTO_START_INTERVAL=' "$BOT_CONFIG" 2>/dev/null; then
+                        sed -i "s/^AUTO_START_INTERVAL=.*/AUTO_START_INTERVAL=\"${v}\"/" "$BOT_CONFIG"
+                    else
+                        echo "AUTO_START_INTERVAL=\"${v}\"" >> "$BOT_CONFIG"
                     fi
                     pending_clear
                     load_config
@@ -7607,6 +7696,10 @@ handle_callback() {
         settings:set:tg_interval)
             pending_set "botset|tg_interval|"
             edit_message "$chat_id" "$message_id" "🔌 <b>Telegram Check Interval</b>\n\nعدد ثانیه رو بفرست.\n• <code>10</code> = هر 10 ثانیه\n• <code>0</code> = خاموش\n\nلغو: <code>لغو</code> یا <code>/cancel</code>" "$(kb_settings)"
+            ;;
+        settings:set:auto_start_interval)
+            pending_set "botset|auto_start_interval|"
+            edit_message "$chat_id" "$message_id" "🛟 <b>Auto-start Interval</b>\n\nهر چند ثانیه سرویس‌های Paqet چک بشن و اگر خاموش بودند روشن شوند؟\n• <code>5</code> = هر 5 ثانیه\n• <code>0</code> = خاموش\n\nلغو: <code>لغو</code> یا <code>/cancel</code>" "$(kb_settings)"
             ;;
         settings:set:watch_interval)
             pending_set "botset|watch_interval|"
@@ -7817,6 +7910,7 @@ main() {
     local last_watch=0
     local boot_sent="false"
     local last_tg_check=0
+    local last_autostart_check=0
     local last_tg_restart=0
     local tg_fail=0
     local cooldown=60
@@ -7852,8 +7946,19 @@ main() {
             fi
         fi
 
+        # Paqet auto-start self-heal (start inactive tunnels)
+        if [[ "${AUTO_START_INTERVAL}" =~ ^[0-9]+$ ]] && [ "${AUTO_START_INTERVAL}" -gt 0 ]; then
+            local nowA
+            nowA=$(date +%s)
+            if [ $((nowA - last_autostart_check)) -ge "${AUTO_START_INTERVAL}" ]; then
+                ensure_paqet_services_running
+                last_autostart_check="$nowA"
+            fi
+        fi
+
+
         if [ "$ENABLE_BOOT_REPORT" = "true" ] && [ "$boot_sent" = "false" ]; then
-            send_message "$CHAT_ID" "🚀 <b>Bot started</b>\n\n⏱ Watch: <code>${WATCH_INTERVAL}s</code>\n🔌 TG check: <code>${TG_CONNECTIVITY_INTERVAL}s</code>\n(۰ یعنی خاموش)" ""
+            send_message "$CHAT_ID" "🚀 <b>Bot started</b>\n\n⏱ Watch: <code>${WATCH_INTERVAL}s</code>\n🔌 TG check: <code>${TG_CONNECTIVITY_INTERVAL}s</code>\n🛟 Auto-start: <code>${AUTO_START_INTERVAL}s</code>\n(۰ یعنی خاموش)" ""
             boot_sent="true"
             state_write
         fi
@@ -8314,6 +8419,7 @@ telegram_bot_menu() {
         echo -e "  ${WHITE}[2]${NC} Service Watch [$( [ "$ENABLE_SERVICE_WATCH" = "true" ] && echo "✅ ON" || echo "❌ OFF")]"
         echo -e "  ${WHITE}[3]${NC} Watch Interval (current: ${CYAN}${WATCH_INTERVAL}s${NC})"
         echo -e "  ${WHITE}[11]${NC} Telegram Check Interval (current: ${CYAN}${TG_CONNECTIVITY_INTERVAL:-10}s${NC}) [0=OFF]"
+        echo -e "  ${WHITE}[12]${NC} Auto-start Interval (current: ${CYAN}${AUTO_START_INTERVAL:-5}s${NC}) [0=OFF]"
         
         echo -e "\n${YELLOW}══════════════════════════════════════════════════════════════${NC}"
         echo -e "${CYAN}PROXY SETTINGS:${NC}"
