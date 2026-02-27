@@ -838,7 +838,62 @@ WATCHER_DEFAULT_PATTERN="%!s"
 WATCHER_DEFAULT_RESTART_DELAY=2
 
 _watcher_python_bin() {
-    command -v python3 2>/dev/null || echo "/usr/bin/python3"
+    local py=""
+    py=$(command -v python3 2>/dev/null || true)
+
+    if [ -n "$py" ] && [ -x "$py" ]; then
+        echo "$py"
+        return 0
+    fi
+
+    # Fallback for minimal PATH environments
+    if [ -x "/usr/bin/python3" ]; then
+        echo "/usr/bin/python3"
+        return 0
+    fi
+
+    echo ""
+    return 1
+}
+
+_watcher_escape_systemd_quotes() {
+    # Escape backslashes and double quotes for systemd ExecStart="..."
+    printf "%s" "$1" | sed 's/\\/\\\\/g; s/\"/\\\"/g'
+}
+
+ensure_python3() {
+    # Watcher requires python3. Install it only when Watcher is enabled.
+    if command -v python3 >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local os
+    os=$(detect_os)
+
+    print_warning "python3 not found. Watcher requires python3."
+    print_step "Installing python3..."
+
+    case $os in
+        ubuntu|debian)
+            apt update -qq >/dev/null 2>&1 || true
+            apt install -y python3 >/dev/null 2>&1 || true
+            ;;
+        centos|rhel|fedora|rocky|almalinux)
+            yum install -y python3 >/dev/null 2>&1 || dnf install -y python3 >/dev/null 2>&1 || true
+            ;;
+        *)
+            print_error "Cannot auto-install python3 on OS: $os. Please install python3 manually."
+            return 1
+            ;;
+    esac
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        print_error "python3 installation failed. Please install python3 manually and try again."
+        return 1
+    fi
+
+    print_success "python3 installed."
+    return 0
 }
 
 _watcher_pause() {
@@ -1154,13 +1209,21 @@ _watcher_apply_override() {
     # Validate numbers
     if ! [[ "$WATCHER_GRACE" =~ ^[0-9]+$ ]]; then WATCHER_GRACE="$WATCHER_DEFAULT_GRACE"; fi
     if ! [[ "$WATCHER_RESTART_DELAY" =~ ^[0-9]+$ ]]; then WATCHER_RESTART_DELAY="$WATCHER_DEFAULT_RESTART_DELAY"; fi
+    # Ensure python3 exists (Watcher runs via python)
+    if ! ensure_python3; then
+        return 1
+    fi
 
     local py
     py=$(_watcher_python_bin)
+    if [ -z "$py" ]; then
+        print_error "python3 not found (required for watcher)."
+        return 1
+    fi
 
     local pattern_systemd
     pattern_systemd=$(_watcher_escape_systemd_percent "$WATCHER_PATTERN")
-
+    pattern_systemd=$(_watcher_escape_systemd_quotes "$pattern_systemd")
     local odir
     odir=$(_watcher_override_dir "$unit")
     mkdir -p "$odir" 2>/dev/null || true
@@ -1169,7 +1232,7 @@ _watcher_apply_override() {
 [Service]
 Environment=PYTHONUNBUFFERED=1
 ExecStart=
-ExecStart=${py} ${WATCHER_SCRIPT} --binary ${BIN_DIR}/paqet --config ${cfg_file} --pattern ${pattern_systemd} --grace ${WATCHER_GRACE} --restart-delay ${WATCHER_RESTART_DELAY}
+ExecStart=${py} "${WATCHER_SCRIPT}" --binary "${BIN_DIR}/paqet" --config "${cfg_file}" --pattern "${pattern_systemd}" --grace ${WATCHER_GRACE} --restart-delay ${WATCHER_RESTART_DELAY}
 EOF
 
     systemctl daemon-reload >/dev/null 2>&1 || true
