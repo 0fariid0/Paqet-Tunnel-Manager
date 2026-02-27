@@ -6811,6 +6811,73 @@ svc_status_detail() {
 }
 
 
+# -----------------------------
+# Service detail helpers (for bot panel)
+# -----------------------------
+cfg_get_mode() {
+    local f="$1"
+    grep -m1 "mode:" "$f" 2>/dev/null | awk '{print $2}' | tr -d '"' || true
+}
+cfg_get_mtu() {
+    local f="$1"
+    grep -m1 "mtu:" "$f" 2>/dev/null | awk '{print $2}' | tr -d '"' || true
+}
+cfg_get_conn() {
+    local f="$1"
+    grep -m1 "conn:" "$f" 2>/dev/null | awk '{print $2}' | tr -d '"' || true
+}
+
+svc_cron_enabled() {
+    local unit="$1"
+    local line
+    line="$(cron_current "$unit")"
+    [ -n "$line" ] && echo "Yes" || echo "No"
+}
+
+svc_details_block() {
+    local unit
+    unit="$(normalize_unit "$1")"
+    local cfg_file role mode mtu conn cron
+    cfg_file="$(cfg_file_from_unit "$unit")"
+    role="$(cfg_role "$cfg_file")"
+    mode="$(cfg_get_mode "$cfg_file")"
+    mtu="$(cfg_get_mtu "$cfg_file")"
+    conn="$(cfg_get_conn "$cfg_file")"
+    cron="$(svc_cron_enabled "$unit")"
+
+    role="${role:-unknown}"
+    mode="${mode:-fast}"
+    mtu="${mtu:--}"
+    conn="${conn:--}"
+
+    echo -e "┌──────────────────────────────────────────────┐\n"\
+"│ Type             : ${role}$(printf '%*s' $((23-${#role})) '')│\n"\
+"│ KCP Mode         : ${mode}$(printf '%*s' $((23-${#mode})) '')│\n"\
+"│ MTU              : ${mtu}$(printf '%*s' $((23-${#mtu})) '')│\n"\
+"│ Connections      : ${conn}$(printf '%*s' $((23-${#conn})) '')│\n"\
+"│ Auto-Restart     : ${cron}$(printf '%*s' $((23-${#cron})) '')│\n"\
+"└──────────────────────────────────────────────┘"
+}
+
+svc_recent_logs() {
+    local unit
+    unit="$(normalize_unit "$1")"
+    journalctl -u "$unit" -n 60 --no-pager 2>/dev/null | html_escape
+}
+
+svc_view_config() {
+    local unit
+    unit="$(normalize_unit "$1")"
+    local cfg
+    cfg="$(cfg_file_from_unit "$unit")"
+    if [ ! -f "$cfg" ]; then
+        echo "Config not found: ${cfg}" | html_escape
+        return 0
+    fi
+    # limit output so Telegram message doesn't get too big
+    sed -n '1,220p' "$cfg" 2>/dev/null | html_escape
+}
+
 
 svc_state() { systemctl is-active "$1" 2>/dev/null || echo "unknown"; }
 svc_enabled() { systemctl is-enabled "$1" 2>/dev/null || echo "unknown"; }
@@ -6943,6 +7010,7 @@ kb_service_panel() {
 {"inline_keyboard":[
   [{"text":"🟢 Start","callback_data":"svc:${unit}:start"},{"text":"🔴 Stop","callback_data":"svc:${unit}:stop"}],
   [{"text":"🔄 Restart","callback_data":"svc:${unit}:restart"},{"text":"📊 Status","callback_data":"svc:${unit}:status"}],
+  [{"text":"📝 View Recent Logs","callback_data":"svc:${unit}:logs"},{"text":"📄 View Configuration","callback_data":"svc:${unit}:config"}],
   [{"text":"⏰ Cronjob","callback_data":"cron:${unit}:menu"}],
   [{"text":"✏️ ویرایش کانفیگ","callback_data":"cfg:${unit}:menu"}],
   [{"text":"⬅️ لیست سرویس‌ها","callback_data":"menu:services"},{"text":"🏠 منوی اصلی","callback_data":"menu:home"}]
@@ -7046,6 +7114,9 @@ page_home() {
     echo -e "🤖 <b>Paqet Control Panel</b>\n\n"\
 "با دکمه‌ها می‌تونی سرویس‌ها رو مدیریت کنی.\n"\
 "✅ Start/Stop/Restart\n"\
+"📊 Status (جزئیات)\n"\
+"📝 Recent Logs\n"\
+"📄 View Configuration\n"\
 "⏰ Cronjob Auto-Restart\n\n"\
 "برای شروع، یکی از گزینه‌ها رو بزن."
 }
@@ -7062,9 +7133,13 @@ page_service() {
     en=$(svc_enabled "$unit")
     local short="${unit%.service}"
 
+    local details
+    details="$(svc_details_block "$unit" | html_escape)"
+
     echo -e "🧰 <b>${short}</b>\n\n"\
 "وضعیت: <code>${st}</code>\n"\
 "Enabled: <code>${en}</code>\n\n"\
+"<b>Details</b>\n<pre>${details}</pre>\n"\
 "عملیات رو انتخاب کن:"
 }
 
@@ -7348,7 +7423,28 @@ handle_callback() {
             unit="${unit%:menu}"
             edit_message "$chat_id" "$message_id" "$(page_service "$unit")" "$(kb_service_panel "$unit")"
             ;;
-        svc:*.service:start|svc:*.service:stop|svc:*.service:restart|svc:*.service:status)
+                svc:*.service:logs)
+            local unit="${data#svc:}"
+            unit="${unit%:logs}"
+            local logs
+            logs="$(svc_recent_logs "$unit")"
+            edit_message "$chat_id" "$message_id" "📝 <b>Recent Logs</b> — <code>${unit%.service}</code>
+
+<pre>${logs}</pre>" "$(kb_service_panel "$unit")"
+            ;;
+        svc:*.service:config)
+            local unit="${data#svc:}"
+            unit="${unit%:config}"
+            local cfg
+            cfg="$(svc_view_config "$unit")"
+            local cfgfile
+            cfgfile="$(cfg_file_from_unit "$(normalize_unit "$unit")")"
+            edit_message "$chat_id" "$message_id" "📄 <b>Configuration</b> — <code>${unit%.service}</code>
+<code>${cfgfile}</code>
+
+<pre>${cfg}</pre>" "$(kb_service_panel "$unit")"
+            ;;
+svc:*.service:start|svc:*.service:stop|svc:*.service:restart|svc:*.service:status)
             local tmp="${data#svc:}"
             local unit="${tmp%%:*}"
             local act="${tmp#*:}"
