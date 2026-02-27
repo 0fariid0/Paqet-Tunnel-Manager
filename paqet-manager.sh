@@ -8459,6 +8459,19 @@ main
 
 EOF
     chmod +x "$BOT_SCRIPT"
+    # Fix possible CRLF line-endings (can break systemd exec/shebang)
+    if command -v dos2unix >/dev/null 2>&1; then
+        dos2unix -q "$BOT_SCRIPT" >/dev/null 2>&1 || true
+    else
+        # Portable CR removal
+        if grep -q $'\r' "$BOT_SCRIPT" 2>/dev/null; then
+            tr -d '\r' < "$BOT_SCRIPT" > "${BOT_SCRIPT}.tmp" && mv "${BOT_SCRIPT}.tmp" "$BOT_SCRIPT"
+        fi
+    fi
+    if [ ! -f "$BOT_SCRIPT" ]; then
+        print_error "Failed to create bot script at $BOT_SCRIPT"
+        return 1
+    fi
     touch "$BOT_CONFIG_DIR/last_state"
     chmod 666 "$BOT_CONFIG_DIR/last_state"
     print_success "Bot script created at $BOT_SCRIPT"
@@ -8474,9 +8487,9 @@ Wants=network.target
 
 [Service]
 Type=simple
-ExecStart=$BOT_SCRIPT
-Restart=always
-RestartSec=10
+ExecStart=/bin/bash $BOT_SCRIPT
+Restart=on-failure
+RestartSec=5
 User=root
 Group=root
 Environment="BOT_CONFIG=$BOT_CONFIG_FILE"
@@ -8736,11 +8749,13 @@ setup_bot_wizard() {
     
     # 7. Create bot files
     print_step "Creating bot files..."
-    create_bot_script
-    create_bot_service
+    create_bot_script || { print_error "Bot script creation failed"; pause; return; }
+    create_bot_service || { print_error "Bot service creation failed"; pause; return; }
     
     # 8. Start bot service
     print_step "Starting bot service..."
+    systemctl stop $BOT_SERVICE >/dev/null 2>&1 || true
+    systemctl reset-failed $BOT_SERVICE >/dev/null 2>&1 || true
     systemctl enable $BOT_SERVICE >/dev/null 2>&1
     systemctl start $BOT_SERVICE
     sleep 2
