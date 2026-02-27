@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # Paqet Tunnel Manager
-# Version: 7.0
+# Version: 7.1
 # Raw packet-level tunneling for bypassing network restrictions
 # GitHub: https://github.com/hanselime/paqet
 # Manager GitHub: https://github.com/0fariid0/Paqet-Tunnel-Manager
@@ -24,7 +24,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="7.0"
+readonly SCRIPT_VERSION="7.1"
 readonly MANAGER_NAME="paqet-manager"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 
@@ -369,7 +369,7 @@ show_banner() {
     echo "║     ██║     ██║  ██║╚██████╔╝███████╗   ██║                  ║"
     echo "║     ╚═╝     ╚═╝  ╚═╝ ╚══▀▀═╝ ╚══════╝   ╚═╝                  ║"
     echo "║                                                              ║"
-    echo "║          Raw Packet Tunnel-- Firewall Bypass                 ║"
+    echo "║          Raw Packet Tunnel - Firewall Bypass                 ║"
     echo "║                                 Manager v${SCRIPT_VERSION}                 ║"
     echo "║                                                              ║"
     echo "║          https://github.com/0fariid0                         ║"    
@@ -836,9 +836,69 @@ WATCHER_CFG_DIR="$CONFIG_DIR/watcher"
 WATCHER_DEFAULT_GRACE=5
 WATCHER_DEFAULT_PATTERN="%!s"
 WATCHER_DEFAULT_RESTART_DELAY=2
+WATCHER_DEFAULT_COOLDOWN=20
+WATCHER_DEFAULT_MAX_BACKOFF=60
+WATCHER_DEFAULT_STABLE_RESET=300
+WATCHER_DEFAULT_THRESHOLD=1
+WATCHER_DEFAULT_WINDOW=0
 
 _watcher_python_bin() {
-    command -v python3 2>/dev/null || echo "/usr/bin/python3"
+    local py=""
+    py=$(command -v python3 2>/dev/null || true)
+
+    if [ -n "$py" ] && [ -x "$py" ]; then
+        echo "$py"
+        return 0
+    fi
+
+    # Fallback for minimal PATH environments
+    if [ -x "/usr/bin/python3" ]; then
+        echo "/usr/bin/python3"
+        return 0
+    fi
+
+    echo ""
+    return 1
+}
+
+_watcher_escape_systemd_quotes() {
+    # Escape backslashes and double quotes for systemd ExecStart="..."
+    printf "%s" "$1" | sed 's/\\/\\\\/g; s/\"/\\\"/g'
+}
+
+ensure_python3() {
+    # Watcher requires python3. Install it only when Watcher is enabled.
+    if command -v python3 >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local os
+    os=$(detect_os)
+
+    print_warning "python3 not found. Watcher requires python3."
+    print_step "Installing python3..."
+
+    case $os in
+        ubuntu|debian)
+            apt update -qq >/dev/null 2>&1 || true
+            apt install -y python3 >/dev/null 2>&1 || true
+            ;;
+        centos|rhel|fedora|rocky|almalinux)
+            yum install -y python3 >/dev/null 2>&1 || dnf install -y python3 >/dev/null 2>&1 || true
+            ;;
+        *)
+            print_error "Cannot auto-install python3 on OS: $os. Please install python3 manually."
+            return 1
+            ;;
+    esac
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        print_error "python3 installation failed. Please install python3 manually and try again."
+        return 1
+    fi
+
+    print_success "python3 installed."
+    return 0
 }
 
 _watcher_pause() {
@@ -875,9 +935,19 @@ _watcher_cfg_file() {
 }
 
 _watcher_ensure_script() {
-    # If the watcher python file is missing, generate it automatically.
+    # Ensure watcher script exists (auto-generate). If an older manager-generated
+    # watcher is found, upgrade it (keep a .bak copy) so improvements apply.
     if [ -f "$WATCHER_SCRIPT" ]; then
-        return 0
+        if grep -q "Watch paqet logs and restart on pattern after grace period" "$WATCHER_SCRIPT" 2>/dev/null; then
+            if grep -q -- "--cooldown" "$WATCHER_SCRIPT" 2>/dev/null; then
+                return 0
+            fi
+            # Old generated watcher detected -> backup then upgrade
+            cp -f "$WATCHER_SCRIPT" "${WATCHER_SCRIPT}.bak.$(date +%s)" 2>/dev/null || true
+        else
+            # User-provided watcher script -> do not overwrite
+            return 0
+        fi
     fi
 
     mkdir -p "$(dirname "$WATCHER_SCRIPT")" 2>/dev/null || true
@@ -886,15 +956,23 @@ _watcher_ensure_script() {
 #!/usr/bin/env python3
 import argparse
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
+from collections import deque
 
+ANSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+
+def strip_ansi(s: str) -> str:
+    return ANSI_RE.sub("", s)
 
 def terminate_process_group(proc: subprocess.Popen, timeout: int = 5) -> None:
     """Terminate whole process group (paqet + children) safely."""
     try:
+        if proc.poll() is not None:
+            return
         os.killpg(proc.pid, signal.SIGTERM)
         proc.wait(timeout=timeout)
     except Exception:
@@ -903,22 +981,80 @@ def terminate_process_group(proc: subprocess.Popen, timeout: int = 5) -> None:
         except Exception:
             pass
 
+def parse_patterns(pattern: str):
+    """Supports multiple patterns separated by '||' (OR)."""
+    parts = [p.strip() for p in (pattern or "").split("||")]
+    return [p for p in parts if p]
 
-def run_watch_loop(binary: str, config: str, pattern: str, grace: int, restart_delay: int) -> None:
+def should_trigger(line: str, patterns) -> bool:
+    if not patterns:
+        return False
+    # Don't accidentally match our own watcher lines
+    if line.startswith("[Watcher]"):
+        return False
+    for p in patterns:
+        if p in line:
+            return True
+    return False
+
+def run_watch_loop(
+    binary: str,
+    config: str,
+    pattern: str,
+    grace: int,
+    restart_delay: int,
+    cooldown: int,
+    max_backoff: int,
+    stable_reset: int,
+    threshold: int,
+    window_s: float,
+) -> None:
     cmd = [binary, "run", "-c", config]
+    patterns = parse_patterns(pattern)
+
+    consecutive = 0
+    ignore_until = 0.0
+
+    # Sliding window of trigger timestamps. We restart when
+    # we see >= threshold matches within window_s seconds.
+    trigger_times: deque[float] = deque()
+
+    def prune(now: float):
+        if window_s <= 0:
+            return
+        cutoff = now - window_s
+        while trigger_times and trigger_times[0] < cutoff:
+            trigger_times.popleft()
 
     while True:
+        now = time.time()
+        if now < ignore_until:
+            time.sleep(max(0.5, ignore_until - now))
+
+        # Backoff delay grows on repeated restarts due to pattern/exits
+        backoff = min(max_backoff, restart_delay * (2 ** max(0, consecutive - 1)))
+
         print(f"[Watcher] Starting: {' '.join(cmd)}", flush=True)
-        print(f"[Watcher] Ignoring '{pattern}' for first {grace}s", flush=True)
+        if grace > 0:
+            print(f"[Watcher] Grace: ignoring trigger for first {grace}s", flush=True)
+        if patterns:
+            print(f"[Watcher] Trigger patterns: {' || '.join(patterns)}", flush=True)
+        if threshold > 1 and window_s > 0:
+            print(f"[Watcher] Trigger rule: {threshold} matches within {window_s:.1f}s", flush=True)
+        print(f"[Watcher] Cooldown={cooldown}s  MaxBackoff={max_backoff}s  StableReset={stable_reset}s", flush=True)
+        if backoff != restart_delay:
+            print(f"[Watcher] Backoff active: next restart delay = {backoff}s (consecutive={consecutive})", flush=True)
 
         if not os.path.exists(binary):
             print(f"[Watcher] ERROR: binary not found: {binary}", flush=True)
-            time.sleep(5)
+            consecutive = min(consecutive + 1, 20)
+            time.sleep(min(30, backoff))
             continue
 
         if not os.path.exists(config):
             print(f"[Watcher] ERROR: config not found: {config}", flush=True)
-            time.sleep(5)
+            consecutive = min(consecutive + 1, 20)
+            time.sleep(min(30, backoff))
             continue
 
         proc = subprocess.Popen(
@@ -928,46 +1064,111 @@ def run_watch_loop(binary: str, config: str, pattern: str, grace: int, restart_d
             text=True,
             bufsize=1,
             start_new_session=True,
+            errors="replace",
         )
 
         start_time = time.time()
-
+        restart_requested = False
         try:
             assert proc.stdout is not None
-            for line in iter(proc.stdout.readline, ""):
-                sys.stdout.write(line)
+            for raw in iter(proc.stdout.readline, ""):
+                # Keep original output in journal, but match on cleaned string
+                sys.stdout.write(raw)
                 sys.stdout.flush()
 
+                line = strip_ansi(raw.rstrip("\n"))
                 elapsed = time.time() - start_time
-                if elapsed >= grace and pattern in line:
-                    print(f"\n[Watcher] Detected pattern after grace ({elapsed:.1f}s). Restarting...", flush=True)
-                    terminate_process_group(proc)
-                    break
+                now = time.time()
 
-            if proc.poll() is not None:
-                print(f"[Watcher] Process exited (code={proc.returncode}). Restarting...", flush=True)
+                if elapsed < grace:
+                    continue
+                if now < ignore_until:
+                    continue
 
+                if should_trigger(line, patterns):
+                    # Reset counters if we were stable long enough
+                    if stable_reset > 0 and elapsed >= stable_reset:
+                        consecutive = 0
+                        trigger_times.clear()
+
+                    if threshold <= 1 or window_s <= 0:
+                        consecutive = min(consecutive + 1, 20)
+                        print(f"\n[Watcher] Detected trigger after {elapsed:.1f}s. Restarting (cooldown {cooldown}s)...", flush=True)
+                        terminate_process_group(proc)
+                        ignore_until = time.time() + max(0, cooldown)
+                        restart_requested = True
+                        break
+
+                    trigger_times.append(now)
+                    prune(now)
+
+                    if len(trigger_times) >= threshold:
+                        consecutive = min(consecutive + 1, 20)
+                        print(
+                            f"\n[Watcher] Detected {len(trigger_times)} triggers within {window_s:.1f}s after {elapsed:.1f}s. "
+                            f"Restarting (cooldown {cooldown}s)...",
+                            flush=True,
+                        )
+                        terminate_process_group(proc)
+                        ignore_until = time.time() + max(0, cooldown)
+                        trigger_times.clear()
+                        restart_requested = True
+                        break
+
+            # If paqet exits by itself, restart (with backoff)
+            if proc.poll() is not None and not restart_requested:
+                elapsed_total = time.time() - start_time
+                if stable_reset > 0 and elapsed_total >= stable_reset:
+                    consecutive = 0
+                    trigger_times.clear()
+
+                rc = proc.returncode
+                consecutive = min(consecutive + 1, 20)
+                print(f"[Watcher] Process exited (code={rc}). Restarting (cooldown {cooldown}s)...", flush=True)
+                ignore_until = time.time() + max(0, cooldown)
+
+        except KeyboardInterrupt:
+            print("\n[Watcher] Stopping (Ctrl+C).", flush=True)
+            terminate_process_group(proc)
+            raise
         except Exception as e:
             print(f"[Watcher] ERROR while watching logs: {e}", flush=True)
             terminate_process_group(proc)
+            consecutive = min(consecutive + 1, 20)
+            ignore_until = time.time() + max(0, cooldown)
 
-        time.sleep(restart_delay)
-
+        time.sleep(max(0, backoff))
 
 def main():
     ap = argparse.ArgumentParser(description="Watch paqet logs and restart on pattern after grace period.")
     ap.add_argument("--binary", default="/usr/local/bin/paqet", help="Path to paqet binary")
     ap.add_argument("--config", required=True, help="Path to config yaml (e.g. /etc/paqet/server.yaml)")
-    ap.add_argument("--pattern", default="%!s", help="Error string/pattern to trigger restart")
-    ap.add_argument("--grace", type=int, default=5, help="Grace period seconds")
-    ap.add_argument("--restart-delay", type=int, default=2, help="Seconds to wait before restarting")
+    ap.add_argument("--pattern", default="%!s", help="Trigger string. Use '||' to OR multiple patterns.")
+    ap.add_argument("--grace", type=int, default=5, help="Grace period seconds before triggers are considered")
+    ap.add_argument("--restart-delay", type=int, default=2, help="Base seconds to wait before restarting")
+    ap.add_argument("--cooldown", type=int, default=20, help="Seconds to ignore triggers right after a restart")
+    ap.add_argument("--max-backoff", type=int, default=60, help="Maximum restart delay under backoff (seconds)")
+    ap.add_argument("--stable-reset", type=int, default=300, help="If tunnel stays up >= this many seconds, reset restart backoff counter")
+    ap.add_argument("--threshold", type=int, default=1, help="How many trigger matches are required to restart")
+    ap.add_argument("--window", type=float, default=0, help="Sliding window seconds for threshold (0 disables windowed counting)")
     args = ap.parse_args()
 
-    run_watch_loop(args.binary, args.config, args.pattern, args.grace, args.restart_delay)
-
+    run_watch_loop(
+        args.binary,
+        args.config,
+        args.pattern,
+        max(0, args.grace),
+        max(0, args.restart_delay),
+        max(0, args.cooldown),
+        max(1, args.max_backoff),
+        max(0, args.stable_reset),
+        max(1, args.threshold),
+        max(0.0, args.window),
+    )
 
 if __name__ == "__main__":
     main()
+
 PYWATCH
 
     chmod +x "$WATCHER_SCRIPT" 2>/dev/null || true
@@ -980,6 +1181,11 @@ _watcher_load_settings() {
     WATCHER_GRACE="$WATCHER_DEFAULT_GRACE"
     WATCHER_PATTERN="$WATCHER_DEFAULT_PATTERN"
     WATCHER_RESTART_DELAY="$WATCHER_DEFAULT_RESTART_DELAY"
+    WATCHER_COOLDOWN="$WATCHER_DEFAULT_COOLDOWN"
+    WATCHER_MAX_BACKOFF="$WATCHER_DEFAULT_MAX_BACKOFF"
+    WATCHER_STABLE_RESET="$WATCHER_DEFAULT_STABLE_RESET"
+    WATCHER_THRESHOLD="$WATCHER_DEFAULT_THRESHOLD"
+    WATCHER_WINDOW="$WATCHER_DEFAULT_WINDOW"
 
     mkdir -p "$WATCHER_CFG_DIR" 2>/dev/null || true
     local f
@@ -991,14 +1197,25 @@ _watcher_load_settings() {
         [ -n "$WATCHER_GRACE" ] || WATCHER_GRACE="$WATCHER_DEFAULT_GRACE"
         [ -n "$WATCHER_PATTERN" ] || WATCHER_PATTERN="$WATCHER_DEFAULT_PATTERN"
         [ -n "$WATCHER_RESTART_DELAY" ] || WATCHER_RESTART_DELAY="$WATCHER_DEFAULT_RESTART_DELAY"
+        [ -n "$WATCHER_COOLDOWN" ] || WATCHER_COOLDOWN="$WATCHER_DEFAULT_COOLDOWN"
+        [ -n "$WATCHER_MAX_BACKOFF" ] || WATCHER_MAX_BACKOFF="$WATCHER_DEFAULT_MAX_BACKOFF"
+        [ -n "$WATCHER_STABLE_RESET" ] || WATCHER_STABLE_RESET="$WATCHER_DEFAULT_STABLE_RESET"
+        [ -n "$WATCHER_THRESHOLD" ] || WATCHER_THRESHOLD="$WATCHER_DEFAULT_THRESHOLD"
+        [ -n "$WATCHER_WINDOW" ] || WATCHER_WINDOW="$WATCHER_DEFAULT_WINDOW"
     fi
 }
 
 _watcher_save_settings() {
+    # Args are optional for backward-compat (older manager passed only 4 args).
     local tunnel="$1"
-    local grace="$2"
-    local delay="$3"
-    local pattern="$4"
+    local grace="${2:-$WATCHER_GRACE}"
+    local delay="${3:-$WATCHER_RESTART_DELAY}"
+    local pattern="${4:-$WATCHER_PATTERN}"
+    local threshold="${5:-$WATCHER_THRESHOLD}"
+    local window="${6:-$WATCHER_WINDOW}"
+    local cooldown="${7:-$WATCHER_COOLDOWN}"
+    local max_backoff="${8:-$WATCHER_MAX_BACKOFF}"
+    local stable_reset="${9:-$WATCHER_STABLE_RESET}"
 
     mkdir -p "$WATCHER_CFG_DIR" 2>/dev/null || true
     local f
@@ -1010,9 +1227,15 @@ _watcher_save_settings() {
     cat > "$f" << EOF
 WATCHER_GRACE=${grace}
 WATCHER_RESTART_DELAY=${delay}
+WATCHER_COOLDOWN=${cooldown}
+WATCHER_MAX_BACKOFF=${max_backoff}
+WATCHER_STABLE_RESET=${stable_reset}
+WATCHER_THRESHOLD=${threshold}
+WATCHER_WINDOW=${window}
 WATCHER_PATTERN='${pat_esc}'
 EOF
 }
+
 
 _watcher_override_dir() {
     local unit="$1"  # example: paqet-ara124.service
@@ -1049,13 +1272,21 @@ _watcher_apply_override() {
     # Validate numbers
     if ! [[ "$WATCHER_GRACE" =~ ^[0-9]+$ ]]; then WATCHER_GRACE="$WATCHER_DEFAULT_GRACE"; fi
     if ! [[ "$WATCHER_RESTART_DELAY" =~ ^[0-9]+$ ]]; then WATCHER_RESTART_DELAY="$WATCHER_DEFAULT_RESTART_DELAY"; fi
+    # Ensure python3 exists (Watcher runs via python)
+    if ! ensure_python3; then
+        return 1
+    fi
 
     local py
     py=$(_watcher_python_bin)
+    if [ -z "$py" ]; then
+        print_error "python3 not found (required for watcher)."
+        return 1
+    fi
 
     local pattern_systemd
     pattern_systemd=$(_watcher_escape_systemd_percent "$WATCHER_PATTERN")
-
+    pattern_systemd=$(_watcher_escape_systemd_quotes "$pattern_systemd")
     local odir
     odir=$(_watcher_override_dir "$unit")
     mkdir -p "$odir" 2>/dev/null || true
@@ -1064,7 +1295,7 @@ _watcher_apply_override() {
 [Service]
 Environment=PYTHONUNBUFFERED=1
 ExecStart=
-ExecStart=${py} ${WATCHER_SCRIPT} --binary ${BIN_DIR}/paqet --config ${cfg_file} --pattern ${pattern_systemd} --grace ${WATCHER_GRACE} --restart-delay ${WATCHER_RESTART_DELAY}
+ExecStart=${py} "${WATCHER_SCRIPT}" --binary "${BIN_DIR}/paqet" --config "${cfg_file}" --pattern "${pattern_systemd}" --grace ${WATCHER_GRACE} --restart-delay ${WATCHER_RESTART_DELAY} --cooldown ${WATCHER_COOLDOWN} --max-backoff ${WATCHER_MAX_BACKOFF} --stable-reset ${WATCHER_STABLE_RESET} --threshold ${WATCHER_THRESHOLD} --window ${WATCHER_WINDOW} --cooldown ${WATCHER_COOLDOWN} --max-backoff ${WATCHER_MAX_BACKOFF} --stable-reset ${WATCHER_STABLE_RESET} --threshold ${WATCHER_THRESHOLD} --window ${WATCHER_WINDOW}
 EOF
 
     systemctl daemon-reload >/dev/null 2>&1 || true
@@ -1118,21 +1349,26 @@ manage_watcher() {
         fi
 
         echo -e "Status: ${CYAN}${enabled}${NC}"
-        echo -e "Config:  grace=${CYAN}${WATCHER_GRACE}s${NC}  delay=${CYAN}${WATCHER_RESTART_DELAY}s${NC}  pattern=${CYAN}${WATCHER_PATTERN}${NC}"
+                echo -e "Config:  grace=${CYAN}${WATCHER_GRACE}s${NC}  delay=${CYAN}${WATCHER_RESTART_DELAY}s${NC}  cooldown=${CYAN}${WATCHER_COOLDOWN}s${NC}  thr=${CYAN}${WATCHER_THRESHOLD}${NC}  win=${CYAN}${WATCHER_WINDOW}s${NC}  pattern=${CYAN}${WATCHER_PATTERN}${NC}  ${YELLOW}(tip: use || for OR)${NC}"
+        echo -e "         maxBackoff=${CYAN}${WATCHER_MAX_BACKOFF}s${NC}  stableReset=${CYAN}${WATCHER_STABLE_RESET}s${NC}"
         echo ""
 
+        \
         echo -e "${CYAN}Actions:${NC}"
         echo -e "  1. Enable watcher for this tunnel"
         echo -e "  2. Disable watcher for this tunnel"
         echo -e "  3. Change grace period"
         echo -e "  4. Change restart delay"
         echo -e "  5. Change pattern"
-        echo -e "  6. Show override file"
-        echo -e "  7. Live logs (Ctrl+C)"
+        echo -e "  6. Change cooldown (ignore triggers after restart)"
+        echo -e "  7. Change trigger sensitivity (threshold + window)"
+        echo -e "  8. Advanced (max-backoff + stable-reset)"
+        echo -e "  9. Show override file"
+        echo -e "  10. Live logs (Ctrl+C)"
         echo -e "  0. Back"
         echo ""
 
-        read -p "Choose option [0-7]: " wchoice
+        read -p "Choose option [0-10]: " wchoice
 
         case "$wchoice" in
             0) return ;;
@@ -1153,9 +1389,8 @@ manage_watcher() {
                     _watcher_pause
                     continue
                 fi
-                _watcher_save_settings "$tunnel" "$g" "$WATCHER_RESTART_DELAY" "$WATCHER_PATTERN"
+                _watcher_save_settings "$tunnel" "$g" "$WATCHER_RESTART_DELAY" "$WATCHER_PATTERN" "$WATCHER_THRESHOLD" "$WATCHER_WINDOW" "$WATCHER_COOLDOWN" "$WATCHER_MAX_BACKOFF" "$WATCHER_STABLE_RESET"
                 print_success "Saved grace=${g} for ${tunnel}"
-                # If enabled, re-apply to take effect
                 if _watcher_is_enabled "$selected_service"; then
                     _watcher_apply_override "$selected_service" "$tunnel"
                 fi
@@ -1170,7 +1405,7 @@ manage_watcher() {
                     _watcher_pause
                     continue
                 fi
-                _watcher_save_settings "$tunnel" "$WATCHER_GRACE" "$d" "$WATCHER_PATTERN"
+                _watcher_save_settings "$tunnel" "$WATCHER_GRACE" "$d" "$WATCHER_PATTERN" "$WATCHER_THRESHOLD" "$WATCHER_WINDOW" "$WATCHER_COOLDOWN" "$WATCHER_MAX_BACKOFF" "$WATCHER_STABLE_RESET"
                 print_success "Saved restart-delay=${d} for ${tunnel}"
                 if _watcher_is_enabled "$selected_service"; then
                     _watcher_apply_override "$selected_service" "$tunnel"
@@ -1179,14 +1414,14 @@ manage_watcher() {
                 ;;
             5)
                 echo ""
-                read -p "Pattern (current: ${WATCHER_PATTERN}): " p
+                read -p "Pattern (current: ${WATCHER_PATTERN}) [tip: use || for OR]: " p
                 p="${p:-$WATCHER_PATTERN}"
                 if [ -z "$p" ]; then
                     print_error "Pattern cannot be empty"
                     _watcher_pause
                     continue
                 fi
-                _watcher_save_settings "$tunnel" "$WATCHER_GRACE" "$WATCHER_RESTART_DELAY" "$p"
+                _watcher_save_settings "$tunnel" "$WATCHER_GRACE" "$WATCHER_RESTART_DELAY" "$p" "$WATCHER_THRESHOLD" "$WATCHER_WINDOW" "$WATCHER_COOLDOWN" "$WATCHER_MAX_BACKOFF" "$WATCHER_STABLE_RESET"
                 print_success "Saved pattern=${p} for ${tunnel}"
                 if _watcher_is_enabled "$selected_service"; then
                     _watcher_apply_override "$selected_service" "$tunnel"
@@ -1194,6 +1429,68 @@ manage_watcher() {
                 _watcher_pause
                 ;;
             6)
+                echo ""
+                read -p "Cooldown seconds (current: ${WATCHER_COOLDOWN}): " c
+                c="${c:-$WATCHER_COOLDOWN}"
+                if ! [[ "$c" =~ ^[0-9]+$ ]]; then
+                    print_error "Invalid number"
+                    _watcher_pause
+                    continue
+                fi
+                _watcher_save_settings "$tunnel" "$WATCHER_GRACE" "$WATCHER_RESTART_DELAY" "$WATCHER_PATTERN" "$WATCHER_THRESHOLD" "$WATCHER_WINDOW" "$c" "$WATCHER_MAX_BACKOFF" "$WATCHER_STABLE_RESET"
+                print_success "Saved cooldown=${c} for ${tunnel}"
+                if _watcher_is_enabled "$selected_service"; then
+                    _watcher_apply_override "$selected_service" "$tunnel"
+                fi
+                _watcher_pause
+                ;;
+            7)
+                echo ""
+                read -p "Threshold matches to trigger restart (current: ${WATCHER_THRESHOLD}): " t
+                t="${t:-$WATCHER_THRESHOLD}"
+                read -p "Window seconds for threshold (0 disables windowing) (current: ${WATCHER_WINDOW}): " w
+                w="${w:-$WATCHER_WINDOW}"
+                if ! [[ "$t" =~ ^[0-9]+$ ]]; then
+                    print_error "Invalid threshold"
+                    _watcher_pause
+                    continue
+                fi
+                if ! [[ "$w" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+                    print_error "Invalid window"
+                    _watcher_pause
+                    continue
+                fi
+                _watcher_save_settings "$tunnel" "$WATCHER_GRACE" "$WATCHER_RESTART_DELAY" "$WATCHER_PATTERN" "$t" "$w" "$WATCHER_COOLDOWN" "$WATCHER_MAX_BACKOFF" "$WATCHER_STABLE_RESET"
+                print_success "Saved threshold=${t}, window=${w}s for ${tunnel}"
+                if _watcher_is_enabled "$selected_service"; then
+                    _watcher_apply_override "$selected_service" "$tunnel"
+                fi
+                _watcher_pause
+                ;;
+            8)
+                echo ""
+                read -p "Max backoff seconds (current: ${WATCHER_MAX_BACKOFF}): " mb
+                mb="${mb:-$WATCHER_MAX_BACKOFF}"
+                read -p "Stable reset seconds (reset backoff if up >= this) (current: ${WATCHER_STABLE_RESET}): " sr
+                sr="${sr:-$WATCHER_STABLE_RESET}"
+                if ! [[ "$mb" =~ ^[0-9]+$ ]]; then
+                    print_error "Invalid max-backoff"
+                    _watcher_pause
+                    continue
+                fi
+                if ! [[ "$sr" =~ ^[0-9]+$ ]]; then
+                    print_error "Invalid stable-reset"
+                    _watcher_pause
+                    continue
+                fi
+                _watcher_save_settings "$tunnel" "$WATCHER_GRACE" "$WATCHER_RESTART_DELAY" "$WATCHER_PATTERN" "$WATCHER_THRESHOLD" "$WATCHER_WINDOW" "$WATCHER_COOLDOWN" "$mb" "$sr"
+                print_success "Saved max-backoff=${mb}s, stable-reset=${sr}s for ${tunnel}"
+                if _watcher_is_enabled "$selected_service"; then
+                    _watcher_apply_override "$selected_service" "$tunnel"
+                fi
+                _watcher_pause
+                ;;
+            9)
                 echo ""
                 local of
                 of=$(_watcher_override_file "$selected_service")
@@ -1206,7 +1503,7 @@ manage_watcher() {
                 fi
                 _watcher_pause
                 ;;
-            7)
+            10)
                 _watcher_live_logs "$selected_service"
                 ;;
             *)
@@ -1214,6 +1511,7 @@ manage_watcher() {
                 _watcher_pause
                 ;;
         esac
+
     done
 }
 
@@ -1313,11 +1611,10 @@ manage_single_service() {
         echo " 8. ⏰ Cronjob Management"
         echo " 9. 👁️  Watcher (Auto Restart on Log Pattern)"
         echo " 10. 🗑️  Delete Service"
-        echo " 11. 📡 Live Logs (Follow)"
         echo " 0. ↩️  Back"
         echo ""
         
-        read -p "Choose action [0-11]: " action
+        read -p "Choose action [0-10]: " action
         
         case "$action" in
             0) return ;;
@@ -1367,9 +1664,6 @@ manage_single_service() {
                pause ;;
             8) manage_cronjob "${selected_service%.service}" "$display_name" ;;
             9) manage_watcher "$selected_service" "$display_name" ;;
-                        11) echo -e "\n${YELLOW}Press Ctrl+C to stop live logs...${NC}\n"
-                journalctl -u "$selected_service" -n 50 -f
-                pause ;;
             10) read -p "Delete this service? (y/N): " confirm
                if [[ "$confirm" =~ ^[Yy]$ ]]; then
                    remove_cronjob "${selected_service%.service}" 2>/dev/null || true
@@ -1451,15 +1745,14 @@ manage_services() {
         
         echo -e "${CYAN}└─────┴──────────────────────────┴─────────────┴───────────┴────────────────┴────────────┴──────────┴────────┘${NC}\n"
         echo -e "${YELLOW}Options:${NC}"
-        echo -e "${YELLOW}Options:${NC}"
         echo -e " 0. ↩️ Back to Main Menu"
         echo -e " 1–${#services[@]}. Select a service to manage"
-        echo -e " L. 🧾 Log Management (Level / Cleanup / Live Logs)"
+        echo -e " 00. 🧾 Log Management (Level / Cleanup / Live Logs)"
         echo ""
         
-        read -p "Enter choice (0 to cancel): " choice
+        read -p "Enter choice (0=back, 00=logs): " choice
 
-        if [[ "$choice" =~ ^[Ll]$ ]]; then
+        if [[ "$choice" == "00" || "$choice" =~ ^[Ll]$ ]]; then
             log_management_menu
             continue
         fi
@@ -1530,15 +1823,19 @@ _log_show_cleanup_status() {
     local enabled="OFF"
     _log_cleanup_enabled && enabled="ON"
 
-    local maxuse retention
-    maxuse=$(_log_read_kv "$JOURNALD_DROPIN_FILE" "SystemMaxUse")
-    retention=$(_log_read_kv "$JOURNALD_DROPIN_FILE" "MaxRetentionSec")
-
-    maxuse="${maxuse:-$DEFAULT_JOURNAL_MAX_USE}"
-    retention="${retention:-$DEFAULT_JOURNAL_RETENTION}"
-
     echo -e "${CYAN}Auto Log Cleanup:${NC} ${GREEN}${enabled}${NC}"
-    echo -e "${CYAN}Journald Limits:${NC} SystemMaxUse=${YELLOW}${maxuse}${NC}  |  MaxRetentionSec=${YELLOW}${retention}${NC}"
+
+    if [ -f "$JOURNALD_DROPIN_FILE" ]; then
+        local maxuse retention
+        maxuse=$(_log_read_kv "$JOURNALD_DROPIN_FILE" "SystemMaxUse")
+        retention=$(_log_read_kv "$JOURNALD_DROPIN_FILE" "MaxRetentionSec")
+        maxuse="${maxuse:-$DEFAULT_JOURNAL_MAX_USE}"
+        retention="${retention:-$DEFAULT_JOURNAL_RETENTION}"
+        echo -e "${CYAN}Journald Limits:${NC} SystemMaxUse=${YELLOW}${maxuse}${NC}  |  MaxRetentionSec=${YELLOW}${retention}${NC}"
+    else
+        echo -e "${CYAN}Journald Limits:${NC} ${YELLOW}OFF${NC} (file not installed)"
+    fi
+
     if [ -f "$LOGROTATE_TELEGRAM_FILE" ]; then
         local freq rotate_count size
         freq=$(grep -E '^\s*(daily|weekly|monthly|yearly)\s*$' "$LOGROTATE_TELEGRAM_FILE" 2>/dev/null | head -n 1 | xargs)
@@ -1596,9 +1893,22 @@ _enable_log_cleanup_defaults() {
 }
 
 _disable_log_cleanup() {
-    rm -f "$JOURNALD_DROPIN_FILE" "$LOGROTATE_TELEGRAM_FILE" >/dev/null 2>&1 || true
+    local removed="yes"
+
+    # Remove both journald limits and telegram logrotate config.
+    rm -f "$LOGROTATE_TELEGRAM_FILE" >/dev/null 2>&1 || removed="no"
+    rm -f "$JOURNALD_DROPIN_FILE" >/dev/null 2>&1 || removed="no"
+
     _log_restart_journald
-    print_success "Auto log cleanup disabled."
+
+    # Verify (so user doesn't feel it's "still on")
+    if [ -f "$JOURNALD_DROPIN_FILE" ] || [ -f "$LOGROTATE_TELEGRAM_FILE" ] || [ "$removed" = "no" ]; then
+        print_warning "Auto log cleanup could not be fully disabled. (Are you running as root?)"
+        [ -f "$JOURNALD_DROPIN_FILE" ] && echo -e "  ${YELLOW}Still present:${NC} $JOURNALD_DROPIN_FILE"
+        [ -f "$LOGROTATE_TELEGRAM_FILE" ] && echo -e "  ${YELLOW}Still present:${NC} $LOGROTATE_TELEGRAM_FILE"
+    else
+        print_success "Auto log cleanup disabled."
+    fi
 }
 
 _configure_log_cleanup() {
@@ -1675,54 +1985,65 @@ _run_cleanup_now() {
 }
 
 _prompt_log_level() {
-    echo ""
-    echo -e "${YELLOW}Select Log Level:${NC}"
-    echo " 1) debug"
-    echo " 2) info"
-    echo " 3) warn"
-    echo " 4) error"
-    echo ""
-    local c
-    read -p "Choice [1-4] (default 2=info): " c
+    local c=""
+    echo "" >&2
+    echo -e "${YELLOW}Select Log Level:${NC}" >&2
+    echo " 1) debug" >&2
+    echo " 2) info" >&2
+    echo " 3) warn" >&2
+    echo " 4) error" >&2
+    echo "" >&2
+    echo -en "Choice [1-4] (default 2=info): " >&2
+    read -r c
+    c=$(echo "$c" | tr '[:upper:]' '[:lower:]' | xargs)
     case "$c" in
-        1) echo "debug" ;;
-        3) echo "warn" ;;
-        4) echo "error" ;;
+        1|debug) echo "debug" ;;
+        3|warn|warning) echo "warn" ;;
+        4|error|err) echo "error" ;;
+        2|info|"") echo "info" ;;
         *) echo "info" ;;
     esac
 }
 
 _log_select_service() {
-    # Echo selected service unit (e.g., paqet-xxx.service) or empty on cancel
+    # Echo selected service unit (e.g., paqet-xxx.service) to STDOUT.
+    # IMPORTANT: All menus/prompts MUST go to STDERR so command substitution
+    # (svc=$(_log_select_service)) doesn't capture them.
     local services=()
-    mapfile -t services < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
-                          grep -E '^paqet-.*\.service' | awk '{print $1}' || true)
+    mapfile -t services < <(
+        systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null \
+        | grep -E '^paqet-.*\.service' | awk '{print $1}' || true
+    )
 
     if [[ ${#services[@]} -eq 0 ]]; then
-        print_warning "No Paqet services found."
-        echo ""
+        print_warning "No Paqet services found." >&2
+        echo "" >&2
         return 1
     fi
 
-    echo -e "\n${CYAN}Select Tunnel:${NC}"
+    echo -e "\n${CYAN}Select Tunnel:${NC}" >&2
     local i=1
     for svc in "${services[@]}"; do
         local display_name="${svc%.service}"
         display_name="${display_name#paqet-}"
         local st
         st=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
-        printf " %2d) %-28s [%s]\n" "$i" "$display_name" "$st"
+        printf " %2d) %-28s [%s]\n" "$i" "$display_name" "$st" >&2
         ((i++))
     done
-    echo " 0) Cancel"
-    echo ""
+    echo " 0) Cancel" >&2
+    echo "" >&2
+
     local choice
     read -p "Choose [0-${#services[@]}]: " choice
     [ "$choice" = "0" ] && return 1
+
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#services[@]} )); then
-        print_error "Invalid selection"
+        print_error "Invalid selection" >&2
         return 1
     fi
+
+    # Only the unit name goes to STDOUT
     echo "${services[$((choice-1))]}"
     return 0
 }
