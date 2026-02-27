@@ -1498,7 +1498,7 @@ manage_single_service() {
         echo " 6. ✏️  Edit Configuration"
         echo " 7. 📄 View Configuration"
         echo " 8. ⏰ Cronjob Management"
-        echo " 9. 👁️  Watcher (Auto Restart on Log Pattern)"
+        echo " 9. 📡 Live logs (Ctrl+C)"
         echo " 10. 🗑️  Delete Service"
         echo " 0. ↩️  Back"
         echo ""
@@ -1552,7 +1552,14 @@ manage_single_service() {
                fi
                pause ;;
             8) manage_cronjob "${selected_service%.service}" "$display_name" ;;
-            9) manage_watcher "$selected_service" "$display_name" ;;
+            9) echo -e "
+${YELLOW}Live logs for ${selected_service} — Press Ctrl+C to return...${NC}
+"
+               # Prevent Ctrl+C from killing the manager; only stop journalctl
+               trap ':' INT
+               journalctl -u "$selected_service" -f -n 50 --no-pager
+               trap - INT
+               ;;
             10) read -p "Delete this service? (y/N): " confirm
                if [[ "$confirm" =~ ^[Yy]$ ]]; then
                    remove_cronjob "${selected_service%.service}" 2>/dev/null || true
