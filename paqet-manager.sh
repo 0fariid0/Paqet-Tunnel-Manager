@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # Paqet Tunnel Manager
-# Version: 8.1
+# Version: 8.2
 # Raw packet-level tunneling for bypassing network restrictions
 # GitHub: https://github.com/hanselime/paqet
 # Manager GitHub: https://github.com/0fariid0/Paqet-Tunnel-Manager
@@ -1328,23 +1328,6 @@ manage_watcher() {
                     _watcher_apply_override "$selected_service" "$tunnel"
                 fi
                 _watcher_pause
-                ;;
-            12)
-                echo -e "\n${YELLOW}Enter Paqet auto-start interval in seconds (0-3600). 0 = OFF:${NC}"
-                read -p "> " new_interval
-                if [[ "$new_interval" =~ ^[0-9]+$ ]] && [ "$new_interval" -ge 0 ] && [ "$new_interval" -le 3600 ]; then
-                    AUTO_START_INTERVAL="$new_interval"
-                    save_bot_config
-                    print_success "Auto-start interval set to ${AUTO_START_INTERVAL}s"
-                    if systemctl is-active --quiet $BOT_SERVICE; then
-                        systemctl restart $BOT_SERVICE
-                        print_info "Bot service restarted to apply new interval"
-                    fi
-                    sleep 1
-                else
-                    print_error "Invalid interval (0-3600)"
-                    sleep 2
-                fi
                 ;;
             4)
                 echo ""
@@ -4634,10 +4617,6 @@ manage_all_services() {
                     AUTO_START_INTERVAL="$new_interval"
                     save_bot_config
                     print_success "Auto-start interval set to ${AUTO_START_INTERVAL}s"
-                    if systemctl is-active --quiet $BOT_SERVICE 2>/dev/null; then
-                        systemctl restart $BOT_SERVICE >/dev/null 2>&1 || true
-                        print_info "Bot service restarted to apply new interval"
-                    fi
                     sleep 1
                 else
                     print_error "Invalid interval (0-3600)"
@@ -6220,6 +6199,113 @@ EOF
     print_success "Bot configuration saved"
 }
 
+
+# ================================================
+# PAQET AUTO-START DAEMON (SYSTEMD)
+# ================================================
+# This runs independent of Telegram (important for Iran servers where Telegram may be blocked).
+# Interval is controlled by AUTO_START_INTERVAL in $BOT_CONFIG_FILE. 0 disables the daemon.
+readonly PAQET_AUTOSTART_SERVICE="paqet-autostart"
+readonly PAQET_AUTOSTART_SCRIPT="/usr/local/bin/paqet-autostart"
+readonly PAQET_AUTOSTART_UNIT="/etc/systemd/system/${PAQET_AUTOSTART_SERVICE}.service"
+readonly PAQET_AUTOSTART_LOG="/var/log/paqet-autostart.log"
+
+ensure_paqet_autostart_daemon() {
+    # Create daemon script
+    cat > "$PAQET_AUTOSTART_SCRIPT" << 'EOS'
+#!/usr/bin/env bash
+set -euo pipefail
+
+BOT_CONFIG_FILE="/etc/telegram-paqet-bot/config.conf"
+LOG_FILE="/var/log/paqet-autostart.log"
+
+log() {
+  echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+list_paqet_services() {
+  {
+    systemctl list-unit-files 'paqet-*.service' --no-legend --no-pager 2>/dev/null | awk '{print $1}'
+    systemctl list-units 'paqet-*.service' --type=service --all --no-legend --no-pager 2>/dev/null | awk '{print $1}'
+  } | grep -E '^paqet-.*\.service$' | sort -u
+}
+
+get_interval() {
+  local v="5"
+  if [ -f "$BOT_CONFIG_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$BOT_CONFIG_FILE" >/dev/null 2>&1 || true
+    v="${AUTO_START_INTERVAL:-5}"
+  fi
+  if [[ "${v}" =~ ^[0-9]+$ ]]; then
+    echo "$v"
+  else
+    echo "5"
+  fi
+}
+
+touch "$LOG_FILE" 2>/dev/null || true
+log "paqet-autostart daemon started"
+
+while true; do
+  interval="$(get_interval)"
+  if [ "$interval" -le 0 ]; then
+    sleep 5
+    continue
+  fi
+
+  while read -r u; do
+    [ -z "$u" ] && continue
+    if ! systemctl is-active --quiet "$u" 2>/dev/null; then
+      # Try start; if it errors, try restart (some units may be in failed state)
+      systemctl start "$u" >/dev/null 2>&1 || systemctl restart "$u" >/dev/null 2>&1 || true
+      log "self-heal: started ${u}"
+    fi
+  done < <(list_paqet_services)
+
+  sleep "$interval"
+done
+EOS
+    chmod +x "$PAQET_AUTOSTART_SCRIPT" 2>/dev/null || true
+
+    # Create systemd unit
+    cat > "$PAQET_AUTOSTART_UNIT" << EOF
+[Unit]
+Description=Paqet auto-start self-heal (restart paqet-* if down)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash $PAQET_AUTOSTART_SCRIPT
+Restart=always
+RestartSec=2
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+apply_paqet_autostart_daemon() {
+    init_bot_config
+    load_bot_config
+
+    ensure_paqet_autostart_daemon
+
+    local v="${AUTO_START_INTERVAL:-5}"
+    if [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -gt 0 ]; then
+        systemctl enable "$PAQET_AUTOSTART_SERVICE" >/dev/null 2>&1 || true
+        systemctl restart "$PAQET_AUTOSTART_SERVICE" >/dev/null 2>&1 || systemctl start "$PAQET_AUTOSTART_SERVICE" >/dev/null 2>&1 || true
+    else
+        systemctl disable "$PAQET_AUTOSTART_SERVICE" >/dev/null 2>&1 || true
+        systemctl stop "$PAQET_AUTOSTART_SERVICE" >/dev/null 2>&1 || true
+    fi
+}
+
 # ================================================
 # Detect SOCKS5 proxy from client configs
 # ================================================
@@ -6542,6 +6628,10 @@ send_message() {
     local reply_markup_json="${3:-}"
     local parse_mode="${4:-HTML}"
 
+    # Interpret 
+ sequences in text
+    text=\"$(printf '%b' \"$text\")\"
+
     [ -z "$chat_id" ] && return 1
 
     local payload
@@ -6567,6 +6657,10 @@ edit_message() {
     local text="$3"
     local reply_markup_json="${4:-}"
     local parse_mode="${5:-HTML}"
+
+    # Interpret 
+ sequences in text
+    text=\"$(printf '%b' \"$text\")\"
 
     local payload
     if [ -n "$reply_markup_json" ]; then
@@ -6601,8 +6695,11 @@ answer_callback() {
 # Helpers
 # -----------------------------
 list_paqet_services() {
-    systemctl list-units --type=service --all 2>/dev/null \
-        | awk '{print $1}' | grep -E '^paqet-.*\.service$' | sort -u
+    # Include installed units (even if not loaded) + loaded units, then dedupe.
+    {
+        systemctl list-unit-files 'paqet-*.service' --no-legend --no-pager 2>/dev/null | awk '{print $1}'
+        systemctl list-units 'paqet-*.service' --type=service --all --no-legend --no-pager 2>/dev/null | awk '{print $1}'
+    } | grep -E '^paqet-.*\.service$' | sort -u
 }
 
 normalize_unit() {
@@ -7067,7 +7164,7 @@ kb_main() {
                 ([range(0; ($arr|length); 2) as $i |
                     ($arr[$i:$i+2]
                         | map({
-                            "text": (.|sub("\.service$";"")),
+                            "text": (.|sub("\.service$";"")|sub("^paqet-";"")),
                             "callback_data": ("svc:" + . + ":menu")
                         })
                     )
@@ -7118,7 +7215,7 @@ kb_services_list() {
             [range(0; ($arr|length); 2) as $i |
                 ($arr[$i:$i+2]
                     | map({
-                        "text": (.|sub("\\.service$";"")),
+                        "text": (.|sub("\\.service$";"")|sub("^paqet-";"")),
                         "callback_data": ("svc:" + . + ":menu")
                     })
                 )
@@ -7314,14 +7411,28 @@ page_cfg_menu() {
 }
 
 page_settings() {
-    local msg="⚙️ <b>تنظیمات ربات</b>\n\n"
-    msg+="⏱ Watch Interval: <code>${WATCH_INTERVAL}s</code>\n"
-    msg+="🔌 Telegram Check Interval: <code>${TG_CONNECTIVITY_INTERVAL}s</code>\n"
-    msg+="🛟 Auto-start Interval: <code>${AUTO_START_INTERVAL}s</code>\n"
-    msg+="(۰ یعنی خاموش)\n\n"
-    msg+="راهنما:\n"
-    msg+="• اگر اتصال تلگرام قطع بشه، ربات سرویس‌های Paqet رو ری‌استارت می‌کنه.\n"
-    msg+="• اگر تونل خاموش بشه، با Auto-start تلاش می‌کنه روشنش کنه.\n"
+    local msg="⚙️ <b>تنظیمات</b>
+
+"
+    msg+="⏱ Watch Interval: <code>${WATCH_INTERVAL}s</code>
+"
+    msg+="🔌 Telegram Check Interval: <code>${TG_CONNECTIVITY_INTERVAL}s</code>
+"
+    local as_state="OFF"
+    if systemctl is-active --quiet paqet-autostart 2>/dev/null; then
+        as_state="ON"
+    fi
+    msg+="🛟 Auto-start Interval: <code>${AUTO_START_INTERVAL}s</code>  (<code>${as_state}</code>)
+"
+    msg+="(۰ یعنی خاموش)
+
+"
+    msg+="راهنما:
+"
+    msg+="• Auto-start توسط یک سرویس systemd انجام میشه (حتی اگر ربات به تلگرام وصل نشه).
+"
+    msg+="• TG check (اگر روشن باشه) در صورت قطع اتصال تلگرام، همه تونل‌ها رو ری‌استارت می‌کنه.
+"
     echo -e "$msg"
 }
 
@@ -7506,6 +7617,13 @@ handle_message_text() {
                     fi
                     pending_clear
                     load_config
+                    # Apply systemd auto-start daemon
+                    if [[ "${AUTO_START_INTERVAL}" =~ ^[0-9]+$ ]] && [ "${AUTO_START_INTERVAL}" -gt 0 ]; then
+                        systemctl enable --now paqet-autostart >/dev/null 2>&1 || true
+                        systemctl restart paqet-autostart >/dev/null 2>&1 || true
+                    else
+                        systemctl disable --now paqet-autostart >/dev/null 2>&1 || true
+                    fi
                     send_message "$chat_id" "✅ تنظیم شد.\n\n$(page_settings)" "$(kb_settings)"
                     return 0
                     ;;
@@ -7910,7 +8028,6 @@ main() {
     local last_watch=0
     local boot_sent="false"
     local last_tg_check=0
-    local last_autostart_check=0
     local last_tg_restart=0
     local tg_fail=0
     local cooldown=60
@@ -7946,22 +8063,18 @@ main() {
             fi
         fi
 
-        # Paqet auto-start self-heal (start inactive tunnels)
-        if [[ "${AUTO_START_INTERVAL}" =~ ^[0-9]+$ ]] && [ "${AUTO_START_INTERVAL}" -gt 0 ]; then
-            local nowA
-            nowA=$(date +%s)
-            if [ $((nowA - last_autostart_check)) -ge "${AUTO_START_INTERVAL}" ]; then
-                ensure_paqet_services_running
-                last_autostart_check="$nowA"
-            fi
-        fi
-
-
         if [ "$ENABLE_BOOT_REPORT" = "true" ] && [ "$boot_sent" = "false" ]; then
-            send_message "$CHAT_ID" "🚀 <b>Bot started</b>\n\n⏱ Watch: <code>${WATCH_INTERVAL}s</code>\n🔌 TG check: <code>${TG_CONNECTIVITY_INTERVAL}s</code>\n🛟 Auto-start: <code>${AUTO_START_INTERVAL}s</code>\n(۰ یعنی خاموش)" ""
-            boot_sent="true"
-            state_write
-        fi
+    local boot_msg
+    boot_msg=$(printf "🚀 <b>Bot started</b>
+
+⏱ Watch: <code>%ss</code>
+🔌 TG check: <code>%ss</code>
+🛟 Auto-start: <code>%ss</code>
+(۰ یعنی خاموش)" "${WATCH_INTERVAL}" "${TG_CONNECTIVITY_INTERVAL}" "${AUTO_START_INTERVAL}")
+    send_message "$CHAT_ID" "$boot_msg" ""
+    boot_sent="true"
+    state_write
+fi
 
         local offset
         offset=$(read_offset)
@@ -8042,6 +8155,7 @@ update_bot_keep_settings() {
     print_step "Updating bot script/service (keeping current settings)..."
     create_bot_script || { print_error "Bot script creation failed"; pause; return 1; }
     create_bot_service || { print_error "Bot service creation failed"; pause; return 1; }
+    apply_paqet_autostart_daemon >/dev/null 2>&1 || true
 
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl reset-failed $BOT_SERVICE >/dev/null 2>&1 || true
@@ -8310,6 +8424,8 @@ setup_bot_wizard() {
     create_bot_script || { print_error "Bot script creation failed"; pause; return; }
     create_bot_service || { print_error "Bot service creation failed"; pause; return; }
     
+    # 8. Start bot service    apply_paqet_autostart_daemon >/dev/null 2>&1 || true
+
     # 8. Start bot service
     print_step "Starting bot service..."
     systemctl stop $BOT_SERVICE >/dev/null 2>&1 || true
@@ -8492,6 +8608,22 @@ telegram_bot_menu() {
                     sleep 2
                 fi
                 ;;
+
+12)
+    echo -e "
+${YELLOW}Enter Paqet auto-start interval in seconds (0-3600). 0 = OFF:${NC}"
+    read -p "> " new_interval
+    if [[ "$new_interval" =~ ^[0-9]+$ ]] && [ "$new_interval" -ge 0 ] && [ "$new_interval" -le 3600 ]; then
+        AUTO_START_INTERVAL="$new_interval"
+        save_bot_config
+        apply_paqet_autostart_daemon
+        print_success "Auto-start interval set to ${AUTO_START_INTERVAL}s"
+        sleep 1
+    else
+        print_error "Invalid interval (0-3600)"
+        sleep 2
+    fi
+    ;;
             4)
                 if [ -n "$SOCKS5_PROXY" ]; then
                     [ "$USE_SOCKS5" = "true" ] && USE_SOCKS5="false" || USE_SOCKS5="true"
