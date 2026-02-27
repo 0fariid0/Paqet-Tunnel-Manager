@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # Paqet Tunnel Manager
-# Version: 7.0
+# Version: 7.1
 # Raw packet-level tunneling for bypassing network restrictions
 # GitHub: https://github.com/hanselime/paqet
 # Manager GitHub: https://github.com/0fariid0/Paqet-Tunnel-Manager
@@ -24,7 +24,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="7.0"
+readonly SCRIPT_VERSION="7.1"
 readonly MANAGER_NAME="paqet-manager"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 
@@ -1328,25 +1328,6 @@ manage_watcher() {
                     _watcher_apply_override "$selected_service" "$tunnel"
                 fi
                 _watcher_pause
-                ;;
-
-            11)
-                echo -e "
-${YELLOW}Enter Telegram connectivity check interval (0-3600). 0 = OFF:${NC}"
-                read -p "> " new_interval
-                if [[ "$new_interval" =~ ^[0-9]+$ ]] && [ "$new_interval" -ge 0 ] && [ "$new_interval" -le 3600 ]; then
-                    TG_CONNECTIVITY_INTERVAL="$new_interval"
-                    save_bot_config
-                    print_success "Telegram check interval set to ${TG_CONNECTIVITY_INTERVAL}s"
-                    if systemctl is-active --quiet $BOT_SERVICE; then
-                        systemctl restart $BOT_SERVICE
-                        print_info "Bot service restarted to apply new interval"
-                    fi
-                    sleep 1
-                else
-                    print_error "Invalid interval (0-3600)"
-                    sleep 2
-                fi
                 ;;
             4)
                 echo ""
@@ -7032,7 +7013,7 @@ page_service() {
 kb_main() {
     cat << 'JSON'
 {"inline_keyboard":[
-  [{"text":"🧰 سرویس‌ها","callback_data":"menu:services"},{"text":"📊 وضعیت کلی","callback_data":"menu:status"}],
+  [{"text":"🧰 سرویس‌ها","callback_data":"menu:services"}],
   [{"text":"➕ بیشتر","callback_data":"menu:more"}]
 ]}
 JSON
@@ -7049,6 +7030,7 @@ JSON
 kb_more() {
     cat << 'JSON'
 {"inline_keyboard":[
+  [{"text":"🔄 ری‌استارت همه تونل‌ها","callback_data":"more:restart_all"}],
   [{"text":"⚙️ تنظیمات ربات","callback_data":"menu:settings"}],
   [{"text":"🔁 daemon-reload","callback_data":"more:daemon_reload"}],
   [{"text":"✅ enable همه","callback_data":"more:enable_all"},{"text":"🚫 disable همه","callback_data":"more:disable_all"}],
@@ -7610,6 +7592,11 @@ handle_callback() {
 
     answer_callback "$cb_id" "" false
 
+    # Cancel any pending text-input edit when user taps buttons
+    if [ -n "$(pending_get)" ]; then
+        pending_clear
+    fi
+
     case "$data" in
         menu:home) edit_message "$chat_id" "$message_id" "$(page_home)" "$(kb_main)" ;;
         menu:status) edit_message "$chat_id" "$message_id" "$(format_all_status)" "$(kb_back_home)" ;;
@@ -7624,6 +7611,11 @@ handle_callback() {
         settings:set:watch_interval)
             pending_set "botset|watch_interval|"
             edit_message "$chat_id" "$message_id" "⏱ <b>Watch Interval</b>\n\nعدد ثانیه رو بفرست (1 تا 3600).\n\nلغو: <code>لغو</code> یا <code>/cancel</code>" "$(kb_settings)"
+            ;;
+
+        more:restart_all)
+            restart_all_paqet_services
+            edit_message "$chat_id" "$message_id" "✅ <b>ری‌استارت همه تونل‌ها</b> انجام شد." "$(kb_more)"
             ;;
 
         more:daemon_reload) systemctl daemon-reload >/dev/null 2>&1 || true; edit_message "$chat_id" "$message_id" "✅ <b>daemon-reload</b> انجام شد." "$(kb_more)" ;;
@@ -8374,6 +8366,23 @@ telegram_bot_menu() {
                     fi
                 else
                     print_error "Invalid interval (must be 30-3600)"
+                    sleep 2
+                fi
+                ;;
+            11)
+                echo -e "\n${YELLOW}Enter Telegram connectivity check interval in seconds (0-3600). 0 = OFF:${NC}"
+                read -p "> " new_interval
+                if [[ "$new_interval" =~ ^[0-9]+$ ]] && [ "$new_interval" -ge 0 ] && [ "$new_interval" -le 3600 ]; then
+                    TG_CONNECTIVITY_INTERVAL="$new_interval"
+                    save_bot_config
+                    print_success "Telegram check interval set to ${TG_CONNECTIVITY_INTERVAL}s"
+                    if systemctl is-active --quiet $BOT_SERVICE; then
+                        systemctl restart $BOT_SERVICE
+                        print_info "Bot service restarted to apply new interval"
+                    fi
+                    sleep 1
+                else
+                    print_error "Invalid interval (0-3600)"
                     sleep 2
                 fi
                 ;;
