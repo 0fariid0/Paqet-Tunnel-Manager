@@ -24,7 +24,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="8.7"
+readonly SCRIPT_VERSION="8.8"
 readonly MANAGER_NAME="paqet-manager"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 
@@ -232,10 +232,12 @@ ask_log_level() {
     local default_level="${1:-info}"
     local input=""
 
-    echo -e "\n${CYAN}Log Level${NC}"
-    echo -e "────────────────────────────────────────────────────────────────"
-    echo -e "  debug | info | warn | error"
-    echo -en "${YELLOW}Enter log level [${default_level}]: ${NC}"
+    # Prompts must go to stderr so command-substitution captures only the value
+    echo -e "
+${CYAN}Log Level${NC}" >&2
+    echo -e "────────────────────────────────────────────────────────────────" >&2
+    echo -e "  debug | info | warn | error" >&2
+    echo -en "${YELLOW}Enter log level [${default_level}]: ${NC}" >&2
     read -r input
     input="${input:-$default_level}"
 
@@ -243,7 +245,7 @@ ask_log_level() {
     normalized=$(normalize_log_level "$input" "$default_level")
 
     if [ "$normalized" != "$(echo "$input" | tr '[:upper:]' '[:lower:]' | xargs)" ] && [[ ! "$input" =~ ^[1-4]$ ]]; then
-        print_warning "Unknown log level '$input' → using '$normalized'"
+        print_warning "Unknown log level '$input' → using '$normalized'" >&2
     fi
 
     echo "$normalized"
