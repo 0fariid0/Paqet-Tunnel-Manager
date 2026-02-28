@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # Paqet Tunnel Manager
-# Version: 8.4
+# Version: 8.6
 # Raw packet-level tunneling for bypassing network restrictions
 # GitHub: https://github.com/hanselime/paqet
 # Manager GitHub: https://github.com/0fariid0/Paqet-Tunnel-Manager
@@ -24,7 +24,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="8.4"
+readonly SCRIPT_VERSION="8.1"
 readonly MANAGER_NAME="paqet-manager"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 
@@ -369,7 +369,7 @@ show_banner() {
     echo "║     ██║     ██║  ██║╚██████╔╝███████╗   ██║                  ║"
     echo "║     ╚═╝     ╚═╝  ╚═╝ ╚══▀▀═╝ ╚══════╝   ╚═╝                  ║"
     echo "║                                                              ║"
-    echo "║          Raw Packet Tunnel -- Firewall Bypass                ║"
+    echo "║          Raw Packet Tunnel - Firewall Bypass                 ║"
     echo "║                                 Manager v${SCRIPT_VERSION}                 ║"
     echo "║                                                              ║"
     echo "║          https://github.com/0fariid0                         ║"    
@@ -1570,7 +1570,7 @@ manage_services() {
         echo -e "${GREEN}╚═══════════════════════════════════════════════════════════════════════════════════════════════════════════╝${NC}\n"
         
         local services=()
-        mapfile -t services < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
+        mapfile -t services < <(${SYSTEMCTL:-/usr/bin/systemctl} list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
                               grep -E '^paqet-.*\.service' | awk '{print $1}' || true)
         
         if [[ ${#services[@]} -eq 0 ]]; then
@@ -1667,7 +1667,7 @@ DEFAULT_TELEGRAM_ROTATE_SIZE="50M"
 
 cleanup_legacy_log_services() {
     # Remove old log-cleanup units created by older script versions (so they don't show as paqet-*.service)
-    if systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -qx "paqet-log-cleanup.service" \
+    if ${SYSTEMCTL:-/usr/bin/systemctl} list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -qx "paqet-log-cleanup.service" \
        || [ -f "$SERVICE_DIR/paqet-log-cleanup.service" ] || [ -f "$SERVICE_DIR/paqet-log-cleanup.timer" ]; then
         systemctl disable --now paqet-log-cleanup.timer >/dev/null 2>&1 || true
         systemctl disable --now paqet-log-cleanup.service >/dev/null 2>&1 || true
@@ -1888,7 +1888,7 @@ _log_select_service() {
     # (svc=$(_log_select_service)) doesn't capture them.
     local services=()
     mapfile -t services < <(
-        systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null \
+        ${SYSTEMCTL:-/usr/bin/systemctl} list-unit-files --type=service --no-legend --no-pager 2>/dev/null \
         | grep -E '^paqet-.*\.service' | awk '{print $1}' || true
     )
 
@@ -1927,7 +1927,7 @@ _log_select_service() {
 
 _change_log_level_one_or_all() {
     local services=()
-    mapfile -t services < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
+    mapfile -t services < <(${SYSTEMCTL:-/usr/bin/systemctl} list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
                           grep -E '^paqet-.*\.service' | awk '{print $1}' || true)
 
     if [[ ${#services[@]} -eq 0 ]]; then
@@ -4523,7 +4523,7 @@ manage_all_services() {
 
         
         local services=()
-        mapfile -t services < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
+        mapfile -t services < <(${SYSTEMCTL:-/usr/bin/systemctl} list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
                               grep -E '^paqet-.*\.service' | awk '{print $1}' || true)
         
         if [[ ${#services[@]} -eq 0 ]]; then
@@ -4766,7 +4766,7 @@ change_mode_all_services() {
     read -p "Restart all services to apply changes? (y/N): " restart_choice
     if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
         local services=()
-        mapfile -t services < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
+        mapfile -t services < <(${SYSTEMCTL:-/usr/bin/systemctl} list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
                               grep -E '^paqet-.*\.service' | awk '{print $1}' || true)
         restart_all_services "${services[@]}"
     fi
@@ -4825,7 +4825,7 @@ change_conn_all_services() {
     read -p "Restart all services to apply changes? (y/N): " restart_choice
     if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
         local services=()
-        mapfile -t services < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
+        mapfile -t services < <(${SYSTEMCTL:-/usr/bin/systemctl} list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
                               grep -E '^paqet-.*\.service' | awk '{print $1}' || true)
         restart_all_services "${services[@]}"
     fi
@@ -4893,7 +4893,7 @@ change_block_all_services() {
     read -p "Restart all services to apply changes? (y/N): " restart_choice
     if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
         local services=()
-        mapfile -t services < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
+        mapfile -t services < <(${SYSTEMCTL:-/usr/bin/systemctl} list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
                               grep -E '^paqet-.*\.service' | awk '{print $1}' || true)
         restart_all_services "${services[@]}"
     fi
@@ -4955,7 +4955,7 @@ change_log_level_all_services() {
         read -p "Restart all Paqet services to apply changes? (y/N): " restart_choice
         if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
             local services=()
-            mapfile -t services < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
+            mapfile -t services < <(${SYSTEMCTL:-/usr/bin/systemctl} list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
                                   grep -E '^paqet-.*\.service' | awk '{print $1}' || true)
             restart_all_services "${services[@]}"
         fi
@@ -5162,7 +5162,7 @@ apply_connection_protection() {
     read -p "Restart all Paqet services now? (y/N): " restart_choice
     if [[ "$restart_choice" =~ ^[Yy]$ ]]; then
         local services=()
-        mapfile -t services < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
+        mapfile -t services < <(${SYSTEMCTL:-/usr/bin/systemctl} list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
                               grep -E '^paqet-.*\.service' | awk '{print $1}' || true)
         
         for svc in "${services[@]}"; do
@@ -5629,7 +5629,7 @@ run_mtu_test() {
                     local config_name=$(basename "$target_config" .yaml)
                     local service_name="paqet-${config_name}.service"
                     
-                    if systemctl list-unit-files 2>/dev/null | grep -q "$service_name"; then
+                    if ${SYSTEMCTL:-/usr/bin/systemctl} list-unit-files 2>/dev/null | grep -q "$service_name"; then
                         echo ""
                         read -p "Restart this service now? (y/N): " restart_svc
                         if [[ "$restart_svc" =~ ^[Yy]$ ]]; then
@@ -6055,7 +6055,7 @@ uninstall_paqet() {
     print_step "Stopping services..."
     
     local services=()
-    mapfile -t services < <(systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
+    mapfile -t services < <(${SYSTEMCTL:-/usr/bin/systemctl} list-unit-files --type=service --no-legend --no-pager 2>/dev/null |
                           grep -E '^paqet-.*\.service' | awk '{print $1}' || true)
     
     for service in "${services[@]}"; do
@@ -6226,8 +6226,8 @@ log() {
 list_paqet_services() {
     # Robust discovery: unit-files + loaded units + direct unit-file scan (covers inactive/failed and systems where glob filtering fails).
     {
-        systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -E '^paqet-.*\.service$' || true
-        systemctl list-units --type=service --all --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -E '^paqet-.*\.service$' || true
+        ${SYSTEMCTL:-/usr/bin/systemctl} list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -E '^paqet-.*\.service$' | grep -v '^paqet-autostart\.service$' || true
+        ${SYSTEMCTL:-/usr/bin/systemctl} list-units --type=service --all --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -E '^paqet-.*\.service$' | grep -v '^paqet-autostart\.service$' || true
 
         # Fallback: scan common unit dirs
         shopt -s nullglob 2>/dev/null || true
@@ -6705,8 +6705,8 @@ answer_callback() {
 list_paqet_services() {
     # Robust discovery: unit-files + loaded units + direct unit-file scan (covers inactive/failed and systems where glob filtering fails).
     {
-        systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -E '^paqet-.*\.service$' || true
-        systemctl list-units --type=service --all --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -E '^paqet-.*\.service$' || true
+        ${SYSTEMCTL:-/usr/bin/systemctl} list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -E '^paqet-.*\.service$' | grep -v '^paqet-autostart\.service$' || true
+        ${SYSTEMCTL:-/usr/bin/systemctl} list-units --type=service --all --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -E '^paqet-.*\.service$' | grep -v '^paqet-autostart\.service$' || true
 
         # Fallback: scan common unit dirs
         shopt -s nullglob 2>/dev/null || true
@@ -7169,26 +7169,39 @@ page_service() {
 # Keyboards
 # -----------------------------
 kb_main() {
-    # Main menu: show services directly + More button
-    local units_json
-    units_json="$(list_paqet_services | jq -R . | jq -s .)"
+    # Main menu: show services directly + More button (no jq dependency)
+    local units=()
+    local u
+    while read -r u; do
+        [ -n "$u" ] && units+=("$u")
+    done < <(list_paqet_services)
 
-    jq -nc --argjson units "$units_json" '
-        def rows($arr):
-            if ($arr|length)==0 then
-                [[{"text":"➕ بیشتر","callback_data":"menu:more"}]]
-            else
-                ([range(0; ($arr|length); 2) as $i |
-                    ($arr[$i:$i+2]
-                        | map({
-                            "text": (.|sub("\.service$";"")|sub("^paqet-";"")),
-                            "callback_data": ("svc:" + . + ":menu")
-                        })
-                    )
-                ] + [[{"text":"➕ بیشتر","callback_data":"menu:more"}]])
-            end;
-        {inline_keyboard: rows($units)}
-    '
+    # build inline_keyboard JSON
+    local json='{"inline_keyboard":['
+    if [ ${#units[@]} -eq 0 ]; then log "No paqet services found for keyboard"; fi
+
+    local i=0
+    local n=${#units[@]}
+    while [ $i -lt $n ]; do
+        local row='['
+        local j=0
+        while [ $j -lt 2 ] && [ $i -lt $n ]; do
+            local unit="${units[$i]}"
+            local label="${unit%.service}"
+            label="${label#paqet-}"
+            row+='{"text":"'"$label"'","callback_data":"svc:'"$unit"':menu"}'
+            i=$((i+1)); j=$((j+1))
+            if [ $j -lt 2 ] && [ $i -lt $n ]; then row+=','; fi
+        done
+        row+=']'
+        json+="$row"
+        if [ $i -lt $n ]; then json+=','; fi
+    done
+
+    # More button
+    if [ $n -gt 0 ]; then json+=','; fi
+    json+='[{"text":"➕ بیشتر","callback_data":"menu:more"}]]}'
+    echo "$json"
 }
 
 kb_back_home() {
@@ -7224,21 +7237,34 @@ JSON
 }
 
 kb_services_list() {
-    local units_json
-    units_json="$(list_paqet_services | jq -R . | jq -s .)"
+    # List services (no jq dependency)
+    local units=()
+    local u
+    while read -r u; do
+        [ -n "$u" ] && units+=("$u")
+    done < <(list_paqet_services)
 
-    jq -nc --argjson units "$units_json" '
-        def rows($arr):
-            [range(0; ($arr|length); 2) as $i |
-                ($arr[$i:$i+2]
-                    | map({
-                        "text": (.|sub("\\.service$";"")|sub("^paqet-";"")),
-                        "callback_data": ("svc:" + . + ":menu")
-                    })
-                )
-            ];
-        {inline_keyboard: (rows($units) + [[{"text":"🏠 منوی اصلی","callback_data":"menu:home"}]])}
-    '
+    local json='{"inline_keyboard":['
+    local i=0
+    local n=${#units[@]}
+    while [ $i -lt $n ]; do
+        local row='['
+        local j=0
+        while [ $j -lt 2 ] && [ $i -lt $n ]; do
+            local unit="${units[$i]}"
+            local label="${unit%.service}"
+            label="${label#paqet-}"
+            row+='{"text":"'"$label"'","callback_data":"svc:'"$unit"':menu"}'
+            i=$((i+1)); j=$((j+1))
+            if [ $j -lt 2 ] && [ $i -lt $n ]; then row+=','; fi
+        done
+        row+=']'
+        json+="$row"
+        if [ $i -lt $n ]; then json+=','; fi
+    done
+    if [ $n -gt 0 ]; then json+=','; fi
+    json+='[{"text":"🏠 منوی اصلی","callback_data":"menu:home"}]]}'
+    echo "$json"
 }
 
 kb_service_panel() {
@@ -8150,6 +8176,8 @@ RestartSec=5
 User=root
 Group=root
 Environment="BOT_CONFIG=$BOT_CONFIG_FILE"
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=SYSTEMCTL=${SYSTEMCTL:-/usr/bin/systemctl}
 
 [Install]
 WantedBy=multi-user.target
