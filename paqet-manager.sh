@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # Paqet Tunnel Manager
-# Version: 8.6
+# Version: 8.9
 # Raw packet-level tunneling for bypassing network restrictions
 # GitHub: https://github.com/hanselime/paqet
 # Manager GitHub: https://github.com/0fariid0/Paqet-Tunnel-Manager
@@ -24,7 +24,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="8.8"
+readonly SCRIPT_VERSION="8.9"
 readonly MANAGER_NAME="paqet-manager"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 
@@ -7223,8 +7223,6 @@ kb_more() {
 {"inline_keyboard":[
   [{"text":"🔄 ری‌استارت همه تونل‌ها","callback_data":"more:restart_all"}],
   [{"text":"⚙️ تنظیمات ربات","callback_data":"menu:settings"}],
-  [{"text":"🔁 daemon-reload","callback_data":"more:daemon_reload"}],
-  [{"text":"✅ enable همه","callback_data":"more:enable_all"},{"text":"🚫 disable همه","callback_data":"more:disable_all"}],
   [{"text":"⬅️ بازگشت","callback_data":"menu:home"}]
 ]}
 JSON
@@ -7876,16 +7874,6 @@ handle_callback() {
         more:restart_all)
             restart_all_paqet_services
             edit_message "$chat_id" "$message_id" "✅ <b>ری‌استارت همه تونل‌ها</b> انجام شد." "$(kb_more)"
-            ;;
-
-        more:daemon_reload) systemctl daemon-reload >/dev/null 2>&1 || true; edit_message "$chat_id" "$message_id" "✅ <b>daemon-reload</b> انجام شد." "$(kb_more)" ;;
-        more:enable_all)
-            while read -r u; do [ -n "$u" ] && systemctl enable "$u" >/dev/null 2>&1 || true; done < <(list_paqet_services)
-            edit_message "$chat_id" "$message_id" "✅ <b>Enable</b> برای همه سرویس‌های Paqet انجام شد." "$(kb_more)"
-            ;;
-        more:disable_all)
-            while read -r u; do [ -n "$u" ] && systemctl disable "$u" >/dev/null 2>&1 || true; done < <(list_paqet_services)
-            edit_message "$chat_id" "$message_id" "✅ <b>Disable</b> برای همه سرویس‌های Paqet انجام شد." "$(kb_more)"
             ;;
 
         svc:*.service:menu)
