@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # Paqet Tunnel Manager
-# Version: 8.2
+# Version: 8.4
 # Raw packet-level tunneling for bypassing network restrictions
 # GitHub: https://github.com/hanselime/paqet
 # Manager GitHub: https://github.com/0fariid0/Paqet-Tunnel-Manager
@@ -6224,11 +6224,21 @@ log() {
 }
 
 list_paqet_services() {
-  {
-    systemctl list-unit-files 'paqet-*.service' --no-legend --no-pager 2>/dev/null | awk '{print $1}'
-    systemctl list-units 'paqet-*.service' --type=service --all --no-legend --no-pager 2>/dev/null | awk '{print $1}'
-  } | grep -E '^paqet-.*\.service$' | sort -u
+    # Robust discovery: unit-files + loaded units + direct unit-file scan (covers inactive/failed and systems where glob filtering fails).
+    {
+        systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -E '^paqet-.*\.service$' || true
+        systemctl list-units --type=service --all --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -E '^paqet-.*\.service$' || true
+
+        # Fallback: scan common unit dirs
+        shopt -s nullglob 2>/dev/null || true
+        local f
+        for f in /etc/systemd/system/paqet-*.service /lib/systemd/system/paqet-*.service /usr/lib/systemd/system/paqet-*.service; do
+            [ -e "$f" ] && basename "$f"
+        done
+        shopt -u nullglob 2>/dev/null || true
+    } | sort -u
 }
+
 
 get_interval() {
   local v="5"
@@ -6628,9 +6638,8 @@ send_message() {
     local reply_markup_json="${3:-}"
     local parse_mode="${4:-HTML}"
 
-    # Interpret 
- sequences in text
-    text=\"$(printf '%b' \"$text\")\"
+    # Normalize text (convert literal \n to real newlines)
+    text="$(printf '%b' "$text")"
 
     [ -z "$chat_id" ] && return 1
 
@@ -6658,9 +6667,8 @@ edit_message() {
     local reply_markup_json="${4:-}"
     local parse_mode="${5:-HTML}"
 
-    # Interpret 
- sequences in text
-    text=\"$(printf '%b' \"$text\")\"
+    # Normalize text (convert literal \n to real newlines)
+    text="$(printf '%b' "$text")"
 
     local payload
     if [ -n "$reply_markup_json" ]; then
@@ -6695,12 +6703,21 @@ answer_callback() {
 # Helpers
 # -----------------------------
 list_paqet_services() {
-    # Include installed units (even if not loaded) + loaded units, then dedupe.
+    # Robust discovery: unit-files + loaded units + direct unit-file scan (covers inactive/failed and systems where glob filtering fails).
     {
-        systemctl list-unit-files 'paqet-*.service' --no-legend --no-pager 2>/dev/null | awk '{print $1}'
-        systemctl list-units 'paqet-*.service' --type=service --all --no-legend --no-pager 2>/dev/null | awk '{print $1}'
-    } | grep -E '^paqet-.*\.service$' | sort -u
+        systemctl list-unit-files --type=service --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -E '^paqet-.*\.service$' || true
+        systemctl list-units --type=service --all --no-legend --no-pager 2>/dev/null | awk '{print $1}' | grep -E '^paqet-.*\.service$' || true
+
+        # Fallback: scan common unit dirs
+        shopt -s nullglob 2>/dev/null || true
+        local f
+        for f in /etc/systemd/system/paqet-*.service /lib/systemd/system/paqet-*.service /usr/lib/systemd/system/paqet-*.service; do
+            [ -e "$f" ] && basename "$f"
+        done
+        shopt -u nullglob 2>/dev/null || true
+    } | sort -u
 }
+
 
 normalize_unit() {
     local u="$1"
