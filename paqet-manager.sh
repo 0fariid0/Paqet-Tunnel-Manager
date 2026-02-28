@@ -24,7 +24,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="8.6"
+readonly SCRIPT_VERSION="8.7"
 readonly MANAGER_NAME="paqet-manager"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 
@@ -703,6 +703,8 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=SYSTEMCTL=/usr/bin/systemctl
 ExecStart=$BIN_DIR/paqet run -c $CONFIG_DIR/${config_name}.yaml
 Restart=always
 RestartSec=5
@@ -4687,7 +4689,7 @@ stop_all_services() {
         
         if systemctl stop "$svc" >/dev/null 2>&1; then
             sleep 1
-            if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+            if ! ${SYSTEMCTL:-/usr/bin/systemctl} is-active --quiet "$svc" 2>/dev/null; then
                 echo -e "${GREEN}✅ SUCCESS${NC}"
                 ((success_count++))
             else
@@ -6266,9 +6268,9 @@ while true; do
 
   while read -r u; do
     [ -z "$u" ] && continue
-    if ! systemctl is-active --quiet "$u" 2>/dev/null; then
+    if ! ${SYSTEMCTL:-/usr/bin/systemctl} is-active --quiet "$u" 2>/dev/null; then
       # Try start; if it errors, try restart (some units may be in failed state)
-      systemctl start "$u" >/dev/null 2>&1 || systemctl restart "$u" >/dev/null 2>&1 || true
+      ${SYSTEMCTL:-/usr/bin/systemctl} start "$u" >/dev/null 2>&1 || ${SYSTEMCTL:-/usr/bin/systemctl} restart "$u" >/dev/null 2>&1 || true
       log "self-heal: started ${u}"
     fi
   done < <(list_paqet_services)
@@ -6287,6 +6289,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=SYSTEMCTL=/usr/bin/systemctl
 ExecStart=/bin/bash $PAQET_AUTOSTART_SCRIPT
 Restart=always
 RestartSec=2
@@ -7566,7 +7570,7 @@ check_services_down_immediate() {
 
 restart_all_paqet_services() {
     while read -r u; do
-        [ -n "$u" ] && systemctl restart "$u" >/dev/null 2>&1 || true
+        [ -n "$u" ] && ${SYSTEMCTL:-/usr/bin/systemctl} restart "$u" >/dev/null 2>&1 || true
     done < <(list_paqet_services)
 }
 
@@ -7574,8 +7578,8 @@ ensure_paqet_services_running() {
     # Try to start inactive paqet services (no message spam)
     while read -r u; do
         [ -z "$u" ] && continue
-        if ! systemctl is-active --quiet "$u" 2>/dev/null; then
-            systemctl start "$u" >/dev/null 2>&1 || systemctl restart "$u" >/dev/null 2>&1 || true
+        if ! ${SYSTEMCTL:-/usr/bin/systemctl} is-active --quiet "$u" 2>/dev/null; then
+            ${SYSTEMCTL:-/usr/bin/systemctl} start "$u" >/dev/null 2>&1 || ${SYSTEMCTL:-/usr/bin/systemctl} restart "$u" >/dev/null 2>&1 || true
         fi
     done < <(list_paqet_services)
 }
