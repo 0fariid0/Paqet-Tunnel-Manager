@@ -1,7 +1,7 @@
 #!/bin/bash
 #=================================================
 # Paqet Tunnel Manager
-# Version: 8.9
+# Version: 9.0
 # Raw packet-level tunneling for bypassing network restrictions
 # GitHub: https://github.com/hanselime/paqet
 # Manager GitHub: https://github.com/0fariid0/Paqet-Tunnel-Manager
@@ -24,7 +24,7 @@ readonly PURPLE='\033[0;35m'
 readonly NC='\033[0m'
 
 # Script Configuration
-readonly SCRIPT_VERSION="8.9"
+readonly SCRIPT_VERSION="9.0"
 readonly MANAGER_NAME="paqet-manager"
 readonly MANAGER_PATH="/usr/local/bin/$MANAGER_NAME"
 
@@ -828,567 +828,6 @@ manage_cronjob() {
 # WATCHER MANAGEMENT (Log-based restart on pattern)
 # - Creates/Removes systemd drop-in override per tunnel
 # - Stores per-tunnel settings in: $CONFIG_DIR/watcher/<tunnel>.conf
-# ================================================
-
-# Prefer existing watcher script if user already created it
-if [ -f "/root/paqet/paqet_watcher.py" ]; then
-    WATCHER_SCRIPT="/root/paqet/paqet_watcher.py"
-else
-    WATCHER_SCRIPT="$INSTALL_DIR/paqet_watcher.py"
-fi
-WATCHER_CFG_DIR="$CONFIG_DIR/watcher"
-WATCHER_DEFAULT_GRACE=5
-WATCHER_DEFAULT_PATTERN="%!s"
-WATCHER_DEFAULT_RESTART_DELAY=2
-
-_watcher_python_bin() {
-    local py=""
-    py=$(command -v python3 2>/dev/null || true)
-
-    if [ -n "$py" ] && [ -x "$py" ]; then
-        echo "$py"
-        return 0
-    fi
-
-    # Fallback for minimal PATH environments
-    if [ -x "/usr/bin/python3" ]; then
-        echo "/usr/bin/python3"
-        return 0
-    fi
-
-    echo ""
-    return 1
-}
-
-_watcher_escape_systemd_quotes() {
-    # Escape backslashes and double quotes for systemd ExecStart="..."
-    printf "%s" "$1" | sed 's/\\/\\\\/g; s/\"/\\\"/g'
-}
-
-ensure_python3() {
-    # Watcher requires python3. Install it only when Watcher is enabled.
-    if command -v python3 >/dev/null 2>&1; then
-        return 0
-    fi
-
-    local os
-    os=$(detect_os)
-
-    print_warning "python3 not found. Watcher requires python3."
-    print_step "Installing python3..."
-
-    case $os in
-        ubuntu|debian)
-            apt update -qq >/dev/null 2>&1 || true
-            apt install -y python3 >/dev/null 2>&1 || true
-            ;;
-        centos|rhel|fedora|rocky|almalinux)
-            yum install -y python3 >/dev/null 2>&1 || dnf install -y python3 >/dev/null 2>&1 || true
-            ;;
-        *)
-            print_error "Cannot auto-install python3 on OS: $os. Please install python3 manually."
-            return 1
-            ;;
-    esac
-
-    if ! command -v python3 >/dev/null 2>&1; then
-        print_error "python3 installation failed. Please install python3 manually and try again."
-        return 1
-    fi
-
-    print_success "python3 installed."
-    return 0
-}
-
-_watcher_pause() {
-    if command -v pause >/dev/null 2>&1; then
-        pause
-    else
-        echo ""
-        read -p "Press Enter to continue..."
-    fi
-}
-
-_watcher_live_logs() {
-    local unit="$1"
-    echo -e "\n${YELLOW}Live logs for ${unit} — Press Ctrl+C to return...${NC}\n"
-    # Keep the manager running when Ctrl+C is pressed (journalctl will stop, then we return to menu)
-    trap 'echo -e "\n${CYAN}[i] Returning to Watcher menu...${NC}\n"' INT
-    journalctl -u "$unit" -f -n 50 --output=short-iso
-    trap - INT
-}
-
-_watcher_escape_squotes() {
-    # Escape single quotes for bash single-quoted strings
-    printf "%s" "$1" | sed "s/'/'\"'\"'/g"
-}
-
-_watcher_escape_systemd_percent() {
-    # In systemd unit files, '%' is special. Use '%%' for literal '%'.
-    printf "%s" "$1" | sed 's/%/%%/g'
-}
-
-_watcher_cfg_file() {
-    local tunnel="$1"
-    echo "$WATCHER_CFG_DIR/${tunnel}.conf"
-}
-
-_watcher_ensure_script() {
-    # Ensure watcher script exists (auto-generate). If an older manager-generated
-    # watcher is found, upgrade it (keep a .bak copy) so improvements apply.
-    if [ -f "$WATCHER_SCRIPT" ]; then
-        if grep -q "Watch paqet logs and restart on pattern after grace period" "$WATCHER_SCRIPT" 2>/dev/null; then
-            if grep -q -- "--cooldown" "$WATCHER_SCRIPT" 2>/dev/null; then
-                return 0
-            fi
-            # Old generated watcher detected -> backup then upgrade
-            cp -f "$WATCHER_SCRIPT" "${WATCHER_SCRIPT}.bak.$(date +%s)" 2>/dev/null || true
-        else
-            # User-provided watcher script -> do not overwrite
-            return 0
-        fi
-    fi
-
-    mkdir -p "$(dirname "$WATCHER_SCRIPT")" 2>/dev/null || true
-
-    cat > "$WATCHER_SCRIPT" << 'PYWATCH'
-#!/usr/bin/env python3
-import argparse
-import os
-import re
-import signal
-import subprocess
-import sys
-import time
-
-
-ANSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
-
-
-def strip_ansi(s: str) -> str:
-    return ANSI_RE.sub("", s)
-
-
-def terminate_process_group(proc: subprocess.Popen, timeout: int = 5) -> None:
-    """Terminate whole process group (paqet + children) safely."""
-    try:
-        if proc.poll() is not None:
-            return
-        os.killpg(proc.pid, signal.SIGTERM)
-        proc.wait(timeout=timeout)
-    except Exception:
-        try:
-            os.killpg(proc.pid, signal.SIGKILL)
-        except Exception:
-            pass
-
-
-def parse_patterns(pattern: str):
-    """
-    Supports multiple patterns separated by '||' (OR).
-    Example: "%!s||panic||fatal"
-    """
-    parts = [p.strip() for p in pattern.split("||")]
-    return [p for p in parts if p]
-
-
-def should_trigger(line: str, patterns) -> bool:
-    if not patterns:
-        return False
-    # Don't accidentally match our own watcher lines
-    if line.startswith("[Watcher]"):
-        return False
-    for p in patterns:
-        if p in line:
-            return True
-    return False
-
-
-def run_watch_loop(binary: str, config: str, pattern: str, grace: int, restart_delay: int, cooldown: int, max_backoff: int, stable_reset: int) -> None:
-    cmd = [binary, "run", "-c", config]
-    patterns = parse_patterns(pattern)
-
-    consecutive = 0
-    ignore_until = 0.0
-
-    while True:
-        now = time.time()
-        if now < ignore_until:
-            time.sleep(max(0.5, ignore_until - now))
-
-        # Backoff delay grows on repeated restarts due to pattern/exits
-        backoff = min(max_backoff, restart_delay * (2 ** max(0, consecutive - 1)))
-
-        print(f"[Watcher] Starting: {' '.join(cmd)}", flush=True)
-        if grace > 0:
-            print(f"[Watcher] Grace: ignoring trigger for first {grace}s", flush=True)
-        if patterns:
-            print(f"[Watcher] Trigger patterns: {' || '.join(patterns)}", flush=True)
-        print(f"[Watcher] Cooldown={cooldown}s  MaxBackoff={max_backoff}s  StableReset={stable_reset}s", flush=True)
-        if backoff != restart_delay:
-            print(f"[Watcher] Backoff active: next restart delay = {backoff}s (consecutive={consecutive})", flush=True)
-
-        if not os.path.exists(binary):
-            print(f"[Watcher] ERROR: binary not found: {binary}", flush=True)
-            consecutive = min(consecutive + 1, 20)
-            time.sleep(min(30, backoff))
-            continue
-
-        if not os.path.exists(config):
-            print(f"[Watcher] ERROR: config not found: {config}", flush=True)
-            consecutive = min(consecutive + 1, 20)
-            time.sleep(min(30, backoff))
-            continue
-
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            start_new_session=True,
-            errors="replace",
-        )
-
-        start_time = time.time()
-        restart_requested = False
-        try:
-            assert proc.stdout is not None
-            for raw in iter(proc.stdout.readline, ""):
-                # Keep original output in journal, but match on cleaned string
-                sys.stdout.write(raw)
-                sys.stdout.flush()
-
-                line = strip_ansi(raw.rstrip("\n"))
-                elapsed = time.time() - start_time
-
-                if elapsed < grace:
-                    continue
-
-                # Cooldown after a restart to avoid flapping on repeated early lines
-                if time.time() < ignore_until:
-                    continue
-
-                if should_trigger(line, patterns):
-                    # If it has been stable for long enough, reset "consecutive" before counting this restart
-                    if stable_reset > 0 and elapsed >= stable_reset:
-                        consecutive = 0
-
-                    consecutive = min(consecutive + 1, 20)
-                    print(f"\n[Watcher] Detected trigger after {elapsed:.1f}s. Restarting (cooldown {cooldown}s)...", flush=True)
-                    terminate_process_group(proc)
-                    ignore_until = time.time() + max(0, cooldown)
-                    restart_requested = True
-                    break
-
-            # If paqet exits by itself, restart (with backoff)
-            if proc.poll() is not None and not restart_requested:
-                elapsed_total = time.time() - start_time
-                if stable_reset > 0 and elapsed_total >= stable_reset:
-                    consecutive = 0
-
-                rc = proc.returncode
-                consecutive = min(consecutive + 1, 20)
-                print(f"[Watcher] Process exited (code={rc}). Restarting (cooldown {cooldown}s)...", flush=True)
-                ignore_until = time.time() + max(0, cooldown)
-
-        except KeyboardInterrupt:
-            print("\n[Watcher] Stopping (Ctrl+C).", flush=True)
-            terminate_process_group(proc)
-            raise
-        except Exception as e:
-            print(f"[Watcher] ERROR while watching logs: {e}", flush=True)
-            terminate_process_group(proc)
-            consecutive = min(consecutive + 1, 20)
-            ignore_until = time.time() + max(0, cooldown)
-
-        time.sleep(max(0, backoff))
-
-
-def main():
-    ap = argparse.ArgumentParser(description="Watch paqet logs and restart on pattern after grace period.")
-    ap.add_argument("--binary", default="/usr/local/bin/paqet", help="Path to paqet binary")
-    ap.add_argument("--config", required=True, help="Path to config yaml (e.g. /etc/paqet/server.yaml)")
-    ap.add_argument("--pattern", default="%!s", help="Trigger string. Use '||' to OR multiple patterns.")
-    ap.add_argument("--grace", type=int, default=5, help="Grace period seconds before triggers are considered")
-    ap.add_argument("--restart-delay", type=int, default=2, help="Base seconds to wait before restarting")
-    ap.add_argument("--cooldown", type=int, default=20, help="Seconds to ignore triggers right after a restart")
-    ap.add_argument("--max-backoff", type=int, default=60, help="Maximum restart delay under backoff (seconds)")
-    ap.add_argument("--stable-reset", type=int, default=300, help="If tunnel stays up >= this many seconds, reset restart backoff counter")
-    args = ap.parse_args()
-
-    run_watch_loop(
-        args.binary,
-        args.config,
-        args.pattern,
-        max(0, args.grace),
-        max(0, args.restart_delay),
-        max(0, args.cooldown),
-        max(1, args.max_backoff),
-        max(0, args.stable_reset),
-    )
-
-
-if __name__ == "__main__":
-    main()
-
-PYWATCH
-
-    chmod +x "$WATCHER_SCRIPT" 2>/dev/null || true
-}
-
-_watcher_load_settings() {
-    local tunnel="$1"
-
-    # defaults
-    WATCHER_GRACE="$WATCHER_DEFAULT_GRACE"
-    WATCHER_PATTERN="$WATCHER_DEFAULT_PATTERN"
-    WATCHER_RESTART_DELAY="$WATCHER_DEFAULT_RESTART_DELAY"
-
-    mkdir -p "$WATCHER_CFG_DIR" 2>/dev/null || true
-    local f
-    f=$(_watcher_cfg_file "$tunnel")
-
-    if [ -f "$f" ]; then
-        # shellcheck disable=SC1090
-        source "$f" 2>/dev/null || true
-        [ -n "$WATCHER_GRACE" ] || WATCHER_GRACE="$WATCHER_DEFAULT_GRACE"
-        [ -n "$WATCHER_PATTERN" ] || WATCHER_PATTERN="$WATCHER_DEFAULT_PATTERN"
-        [ -n "$WATCHER_RESTART_DELAY" ] || WATCHER_RESTART_DELAY="$WATCHER_DEFAULT_RESTART_DELAY"
-    fi
-}
-
-_watcher_save_settings() {
-    local tunnel="$1"
-    local grace="$2"
-    local delay="$3"
-    local pattern="$4"
-
-    mkdir -p "$WATCHER_CFG_DIR" 2>/dev/null || true
-    local f
-    f=$(_watcher_cfg_file "$tunnel")
-
-    local pat_esc
-    pat_esc=$(_watcher_escape_squotes "$pattern")
-
-    cat > "$f" << EOF
-WATCHER_GRACE=${grace}
-WATCHER_RESTART_DELAY=${delay}
-WATCHER_PATTERN='${pat_esc}'
-EOF
-}
-
-_watcher_override_dir() {
-    local unit="$1"  # example: paqet-ara124.service
-    echo "/etc/systemd/system/${unit}.d"
-}
-
-_watcher_override_file() {
-    local unit="$1"
-    echo "$(_watcher_override_dir "$unit")/override.conf"
-}
-
-_watcher_is_enabled() {
-    local unit="$1"
-    local f
-    f=$(_watcher_override_file "$unit")
-
-    [ -f "$f" ] && grep -q "$WATCHER_SCRIPT" "$f" 2>/dev/null
-}
-
-_watcher_apply_override() {
-    local unit="$1"      # paqet-xxx.service
-    local tunnel="$2"    # xxx
-    local cfg_file="$CONFIG_DIR/${tunnel}.yaml"
-
-    if [ ! -f "$cfg_file" ]; then
-        print_error "Config file not found: $cfg_file"
-        return 1
-    fi
-
-    _watcher_ensure_script
-
-    _watcher_load_settings "$tunnel"
-
-    # Validate numbers
-    if ! [[ "$WATCHER_GRACE" =~ ^[0-9]+$ ]]; then WATCHER_GRACE="$WATCHER_DEFAULT_GRACE"; fi
-    if ! [[ "$WATCHER_RESTART_DELAY" =~ ^[0-9]+$ ]]; then WATCHER_RESTART_DELAY="$WATCHER_DEFAULT_RESTART_DELAY"; fi
-    # Ensure python3 exists (Watcher runs via python)
-    if ! ensure_python3; then
-        return 1
-    fi
-
-    local py
-    py=$(_watcher_python_bin)
-    if [ -z "$py" ]; then
-        print_error "python3 not found (required for watcher)."
-        return 1
-    fi
-
-    local pattern_systemd
-    pattern_systemd=$(_watcher_escape_systemd_percent "$WATCHER_PATTERN")
-    pattern_systemd=$(_watcher_escape_systemd_quotes "$pattern_systemd")
-    local odir
-    odir=$(_watcher_override_dir "$unit")
-    mkdir -p "$odir" 2>/dev/null || true
-
-    cat > "$odir/override.conf" << EOF
-[Service]
-Environment=PYTHONUNBUFFERED=1
-ExecStart=
-ExecStart=${py} "${WATCHER_SCRIPT}" --binary "${BIN_DIR}/paqet" --config "${cfg_file}" --pattern "${pattern_systemd}" --grace ${WATCHER_GRACE} --restart-delay ${WATCHER_RESTART_DELAY}
-EOF
-
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl restart "$unit" >/dev/null 2>&1 || true
-
-    if _watcher_is_enabled "$unit"; then
-        print_success "Watcher enabled for ${tunnel} (grace=${WATCHER_GRACE}s, delay=${WATCHER_RESTART_DELAY}s, pattern=${WATCHER_PATTERN})"
-        return 0
-    fi
-
-    print_warning "Watcher override written, but could not verify enable state. Check: $odir/override.conf"
-    return 0
-}
-
-_watcher_disable_override() {
-    local unit="$1"
-
-    local of
-    of=$(_watcher_override_file "$unit")
-
-    if [ -f "$of" ]; then
-        rm -f "$of" 2>/dev/null || true
-    fi
-
-    local od
-    od=$(_watcher_override_dir "$unit")
-    rmdir "$od" 2>/dev/null || true
-
-    systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl restart "$unit" >/dev/null 2>&1 || true
-
-    print_success "Watcher disabled for ${unit}"
-}
-
-manage_watcher() {
-    local selected_service="$1"   # paqet-xxx.service
-    local tunnel="$2"             # xxx
-
-    while true; do
-        show_banner
-        echo -e "${YELLOW}Watcher (Auto Restart on Log Pattern)${NC}"
-        echo -e "Service: ${CYAN}${selected_service}${NC}"
-        echo -e "Tunnel:  ${CYAN}${tunnel}${NC}"
-        echo ""
-
-        _watcher_load_settings "$tunnel"
-
-        local enabled="OFF"
-        if _watcher_is_enabled "$selected_service"; then
-            enabled="ON"
-        fi
-
-        echo -e "Status: ${CYAN}${enabled}${NC}"
-        echo -e "Config:  grace=${CYAN}${WATCHER_GRACE}s${NC}  delay=${CYAN}${WATCHER_RESTART_DELAY}s${NC}  pattern=${CYAN}${WATCHER_PATTERN}${NC}  ${YELLOW}(tip: use || for OR)${NC}"
-        echo ""
-
-        echo -e "${CYAN}Actions:${NC}"
-        echo -e "  1. Enable watcher for this tunnel"
-        echo -e "  2. Disable watcher for this tunnel"
-        echo -e "  3. Change grace period"
-        echo -e "  4. Change restart delay"
-        echo -e "  5. Change pattern"
-        echo -e "  6. Show override file"
-        echo -e "  7. Live logs (Ctrl+C)"
-        echo -e "  0. Back"
-        echo ""
-
-        read -p "Choose option [0-7]: " wchoice
-
-        case "$wchoice" in
-            0) return ;;
-            1)
-                _watcher_apply_override "$selected_service" "$tunnel"
-                _watcher_pause
-                ;;
-            2)
-                _watcher_disable_override "$selected_service"
-                _watcher_pause
-                ;;
-            3)
-                echo ""
-                read -p "Grace seconds (current: ${WATCHER_GRACE}): " g
-                g="${g:-$WATCHER_GRACE}"
-                if ! [[ "$g" =~ ^[0-9]+$ ]]; then
-                    print_error "Invalid number"
-                    _watcher_pause
-                    continue
-                fi
-                _watcher_save_settings "$tunnel" "$g" "$WATCHER_RESTART_DELAY" "$WATCHER_PATTERN"
-                print_success "Saved grace=${g} for ${tunnel}"
-                # If enabled, re-apply to take effect
-                if _watcher_is_enabled "$selected_service"; then
-                    _watcher_apply_override "$selected_service" "$tunnel"
-                fi
-                _watcher_pause
-                ;;
-            4)
-                echo ""
-                read -p "Restart delay seconds (current: ${WATCHER_RESTART_DELAY}): " d
-                d="${d:-$WATCHER_RESTART_DELAY}"
-                if ! [[ "$d" =~ ^[0-9]+$ ]]; then
-                    print_error "Invalid number"
-                    _watcher_pause
-                    continue
-                fi
-                _watcher_save_settings "$tunnel" "$WATCHER_GRACE" "$d" "$WATCHER_PATTERN"
-                print_success "Saved restart-delay=${d} for ${tunnel}"
-                if _watcher_is_enabled "$selected_service"; then
-                    _watcher_apply_override "$selected_service" "$tunnel"
-                fi
-                _watcher_pause
-                ;;
-            5)
-                echo ""
-                read -p "Pattern (current: ${WATCHER_PATTERN}) [tip: use || for OR]: " p
-                p="${p:-$WATCHER_PATTERN}"
-                if [ -z "$p" ]; then
-                    print_error "Pattern cannot be empty"
-                    _watcher_pause
-                    continue
-                fi
-                _watcher_save_settings "$tunnel" "$WATCHER_GRACE" "$WATCHER_RESTART_DELAY" "$p"
-                print_success "Saved pattern=${p} for ${tunnel}"
-                if _watcher_is_enabled "$selected_service"; then
-                    _watcher_apply_override "$selected_service" "$tunnel"
-                fi
-                _watcher_pause
-                ;;
-            6)
-                echo ""
-                local of
-                of=$(_watcher_override_file "$selected_service")
-                if [ -f "$of" ]; then
-                    echo -e "${CYAN}${of}${NC}"
-                    echo ""
-                    cat "$of"
-                else
-                    print_info "Override not found (watcher likely OFF)."
-                fi
-                _watcher_pause
-                ;;
-            7)
-                _watcher_live_logs "$selected_service"
-                ;;
-            *)
-                print_error "Invalid choice"
-                _watcher_pause
-                ;;
-        esac
-    done
-}
-
 # ================================================
 # SERVICE MANAGEMENT
 # ================================================
@@ -3485,35 +2924,51 @@ test_connection() {
 
 # Check dependencies
 check_dependencies() {
-    local missing_deps=()
     local os
     os=$(detect_os)
-    
-    local common_deps=("curl" "wget" "iptables" "lsof" "jq")
-    
-    case $os in
-        ubuntu|debian)
-            common_deps+=("libpcap-dev" "iproute2" "cron" "dig")
-            ;;
-        centos|rhel|fedora|rocky|almalinux)
-            common_deps+=("libpcap-devel" "iproute" "cronie" "bind-utils")
-            ;;
-    esac
-    
-    for dep in "${common_deps[@]}"; do
-        if ! command -v "$dep" &>/dev/null && 
-           ! dpkg -l | grep -q "$dep" 2>/dev/null && 
-           ! rpm -q "$dep" &>/dev/null 2>&1; then
-            missing_deps+=("$dep")
+
+    local missing_cmds=()
+    local missing_pkgs=()
+
+    # Commands we rely on (bot + manager)
+    local cmd_deps=("bash" "curl" "wget" "jq" "iptables" "lsof" "awk" "sed" "grep" "systemctl")
+
+    # OS packages (not necessarily commands)
+    local deb_pkgs=("libpcap-dev" "iproute2" "cron" "dnsutils" "ca-certificates" "openssl" "dos2unix" "python3")
+    local rpm_pkgs=("libpcap-devel" "iproute" "cronie" "bind-utils" "ca-certificates" "openssl" "dos2unix" "python3")
+
+    for c in "${cmd_deps[@]}"; do
+        if ! command -v "$c" >/dev/null 2>&1; then
+            missing_cmds+=("$c")
         fi
     done
-    
-    if [ ${#missing_deps[@]} -eq 0 ]; then
+
+    case "$os" in
+        ubuntu|debian)
+            for p in "${deb_pkgs[@]}"; do
+                dpkg -s "$p" >/dev/null 2>&1 || missing_pkgs+=("$p")
+            done
+            ;;
+        centos|rhel|fedora|rocky|almalinux)
+            for p in "${rpm_pkgs[@]}"; do
+                rpm -q "$p" >/dev/null 2>&1 || missing_pkgs+=("$p")
+            done
+            ;;
+        *)
+            # Unknown OS: just rely on command checks
+            ;;
+    esac
+
+    if [ ${#missing_cmds[@]} -eq 0 ] && [ ${#missing_pkgs[@]} -eq 0 ]; then
         return 0
-    else
-        echo "${missing_deps[@]}"
-        return 1
     fi
+
+    # Print a concise line for menus
+    local all_missing=()
+    all_missing+=("${missing_cmds[@]}")
+    all_missing+=("${missing_pkgs[@]}")
+    echo "${all_missing[*]}"
+    return 1
 }
 
 # Install dependencies
@@ -3531,7 +2986,7 @@ install_dependencies() {
             apt update -qq >/dev/null 2>&1 || true
             
             print_info "Installing base packages..."
-            apt install -y curl wget jq libpcap-dev iptables lsof iproute2 cron dnsutils >/dev/null 2>&1 || {
+            apt install -y curl wget jq iptables lsof iproute2 cron dnsutils ca-certificates openssl dos2unix python3 libpcap-dev >/dev/null 2>&1 || {
                 print_warning "Some base packages may have failed to install"
             }
             
@@ -3541,7 +2996,7 @@ install_dependencies() {
             
         centos|rhel|fedora|rocky|almalinux)
             print_info "Installing base packages..."
-            yum install -y curl wget jq libpcap-devel iptables lsof iproute cronie bind-utils >/dev/null 2>&1 || {
+            yum install -y curl wget jq iptables lsof iproute cronie bind-utils ca-certificates openssl dos2unix python3 libpcap-devel >/dev/null 2>&1 || {
                 print_warning "Some base packages may have failed to install"
             }
             
